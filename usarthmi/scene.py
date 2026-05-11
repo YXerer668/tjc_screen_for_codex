@@ -220,7 +220,7 @@ def _validate_widget(payload: dict[str, Any]) -> WidgetSpec:
     widget_type = payload.get("type")
     if not isinstance(widget_id, str) or not widget_id:
         raise SceneError("widget.id must be a non-empty string")
-    if widget_type not in {"text", "image", "button", "number"}:
+    if widget_type not in {"text", "image", "button", "number", "timer"}:
         raise SceneError(f"widget '{widget_id}' has unsupported type '{widget_type}'")
 
     for key in ("x", "y", "w", "h"):

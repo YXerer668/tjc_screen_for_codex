@@ -191,18 +191,23 @@ def _build_parser() -> argparse.ArgumentParser:
     hmi_import.add_argument("source", help="PNG/JPG file")
     hmi_import.add_argument("--out", required=True, help="Asset output directory")
 
-    for name in ("add-text", "add-image", "add-button", "add-number"):
+    for name in ("add-text", "add-image", "add-button", "add-number", "add-timer"):
         patch_parser = hmi_sub.add_parser(name, help=f"Append a {name[4:]} widget to a scene file")
         patch_parser.add_argument("--scene", required=True, help="Scene JSON file to modify")
         patch_parser.add_argument("--page", default="page0", help="Target page id")
         patch_parser.add_argument("--id", required=True, help="Widget id")
-        patch_parser.add_argument("--x", type=int, required=True, help="Widget x")
-        patch_parser.add_argument("--y", type=int, required=True, help="Widget y")
-        patch_parser.add_argument("--w", type=int, required=True, help="Widget width")
-        patch_parser.add_argument("--h", type=int, required=True, help="Widget height")
+        geometry_required = name != "add-timer"
+        patch_parser.add_argument("--x", type=int, required=geometry_required, help="Widget x")
+        patch_parser.add_argument("--y", type=int, required=geometry_required, help="Widget y")
+        patch_parser.add_argument("--w", type=int, required=geometry_required, help="Widget width")
+        patch_parser.add_argument("--h", type=int, required=geometry_required, help="Widget height")
         patch_parser.add_argument("--text", help="Widget text")
         patch_parser.add_argument("--value", type=int, help="Widget numeric value")
         patch_parser.add_argument("--asset", help="Asset key for image/button widgets")
+        if name == "add-timer":
+            patch_parser.add_argument("--tim", type=int, help="Timer interval in milliseconds")
+            patch_parser.add_argument("--enabled", action="store_true", help="Set timer en=1")
+            patch_parser.add_argument("--disabled", action="store_true", help="Set timer en=0")
 
     hmi_set_page = hmi_sub.add_parser("set-page", help="Update canvas metadata in a scene file")
     hmi_set_page.add_argument("--scene", required=True, help="Scene JSON/YAML file")
@@ -410,11 +415,20 @@ def _handle_hmi_command(args: argparse.Namespace) -> dict[str, Any]:
     if args.hmi_command == "import-image":
         return import_asset(args.source, args.out)
 
-    if args.hmi_command in {"add-text", "add-image", "add-button", "add-number"}:
+    if args.hmi_command in {"add-text", "add-image", "add-button", "add-number", "add-timer"}:
         scene = load_scene(args.scene)
         page = next((item for item in scene.pages if item.id == args.page), None)
         if page is None:
             raise SceneError(f"Page '{args.page}' not found in scene")
+        style: dict[str, Any] = {}
+        value = args.value
+        if args.hmi_command == "add-timer":
+            if args.enabled and args.disabled:
+                raise SceneError("add-timer accepts only one of --enabled or --disabled")
+            if args.tim is not None:
+                value = args.tim
+            if args.enabled or args.disabled:
+                style["enabled"] = bool(args.enabled)
         page.widgets.append(
             WidgetSpec(
                 id=args.id,
@@ -424,9 +438,9 @@ def _handle_hmi_command(args: argparse.Namespace) -> dict[str, Any]:
                 w=args.w,
                 h=args.h,
                 text=args.text,
-                value=args.value,
+                value=value,
                 resources={"asset": args.asset} if args.asset else {},
-                style={},
+                style=style,
                 bindings={},
             )
         )

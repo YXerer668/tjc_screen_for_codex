@@ -20,6 +20,7 @@ TYPE_RECORD_LENGTHS = {
     "b": 0x54,
     "p": 0x3C,
     "\x01": 0x54,  # slider
+    "3": 0x24,  # timer
     "z": 0x50,  # gauge
     "j": 0x40,  # progress bar
     ":": 0x48,  # QR code
@@ -30,6 +31,7 @@ TYPE_USER_SLOT_COUNTS = {
     "b": 42,
     "p": 28,
     "\x01": 40,
+    "3": 11,
     "z": 40,
     "j": 33,
     ":": 33,
@@ -38,6 +40,7 @@ TEXT_POINTER_RECORD_OFFSETS = {"t": 0x48, "b": 0x4C, ":": 0x44}
 KNOWN_EXTRA_TYPE_CASES = {
     "\x01": "case_17_slider",
     "z": "case_18_gauge",
+    "3": "case_19_timer",
     "j": "case_20_progress",
     ":": "case_21_qrcode",
 }
@@ -49,6 +52,10 @@ IMAGE_BUTTON_MIRROR_EXTRA_INDEX = 17
 IMAGE_BUTTON_PREFIX_INSERT_OFFSET = 0x86
 IMAGE_BUTTON_PREFIX_INSERT = bytes.fromhex("92 48 C9 76")
 PREFIX_DESCRIPTOR_START = 0x3E
+TIMER_TYPE_CODE = "3"
+TYPE_RECORD_HEADER_FLAGS = {
+    TIMER_TYPE_CODE: 0x27,
+}
 IMAGE_BUTTON_MIRROR_RELATIVE_VALUES = (
     9,
     10,
@@ -186,6 +193,7 @@ class _UserRecordTemplate:
     word1_delta: int
     word2: int
     word3: int
+    word4: int
     word5: int
 
 
@@ -613,6 +621,7 @@ def _load_tail_seed(
                     word1_delta=words[1] - value_base,
                     word2=words[2],
                     word3=words[3],
+                    word4=words[4],
                     word5=words[5],
                 )
             )
@@ -704,7 +713,7 @@ def _find_mirror_record_offsets(tail: bytes, mirror_start: int, blocks: list[Pag
     for block in blocks:
         type_code = block.type_code
         object_id = _required_field_int(block, "id")
-        header = bytes([ord(type_code), object_id, 0, 0x37])
+        header = bytes([ord(type_code), object_id, 0, _record_header_flag(type_code)])
         found = tail.find(header, cursor, min(len(tail), cursor + 0x400))
         if found < 0:
             raise TftToolchainError(
@@ -753,7 +762,7 @@ def _build_added_object_tail(
         target_blocks,
     )
     out.extend(_code_block(primary_data))
-    if any(block.type_code == "\x01" for block in target_blocks):
+    if any(block.type_code in {"\x01", TIMER_TYPE_CODE} for block in target_blocks):
         out.extend(_code_block(bytes.fromhex("09 1f 04 34")))
     out.extend(_code_block(b"\x09\x30\x08"))
     out.extend(_code_block(b""))
@@ -796,7 +805,7 @@ def _build_added_object_tail(
     padding_offset = len(out)
     padding_size = (-len(out)) % 4
     if padding_size:
-        padding_byte = b"\xFF" if image_button_layout else b"\x00"
+        padding_byte = b"\xFF" if image_button_layout or any(block.type_code == TIMER_TYPE_CODE for block in target_blocks) else b"\x00"
         out.extend(padding_byte * padding_size)
     out.extend(b"\x00\x00\x00\x00")
     return bytes(out), {
@@ -868,6 +877,12 @@ def _build_object_event_table(block: PageBlock) -> bytes:
                 _compile_event_script(events.get("codesslide-", [])),
             ]
         )
+    elif block.type_code == TIMER_TYPE_CODE:
+        parts = [
+            _compile_event_script([]),
+            _event_item(b"timer"),
+            _compile_event_script(events.get("codestimer-", [])),
+        ]
     return b"".join(parts)
 
 
@@ -968,6 +983,8 @@ def _build_primary_block(
     text_slots: list[tuple[str, int]] = []
     text_pointer_by_id: dict[int, int] = {}
     string_cursor = 0
+    timer_tail_layout = bool(target_blocks and target_blocks[-1].type_code == TIMER_TYPE_CODE)
+    string_pointer_bias = 0x10 if timer_tail_layout else 0x14
     for block, value_base in zip(target_blocks, value_offsets):
         type_code = block.type_code
         record = bytearray(seed.primary_templates[type_code])
@@ -975,9 +992,12 @@ def _build_primary_block(
         record[0] = ord(type_code)
         record[1] = object_id
         record[2] = 0
-        record[3] = 0x37
-        record[0x1C:0x20] = value_base.to_bytes(4, "little")
-        record[0x28:0x34] = _coord_payload(block)
+        record[3] = _record_header_flag(type_code)
+        if type_code == TIMER_TYPE_CODE:
+            _patch_timer_record(record, block)
+        else:
+            record[0x1C:0x20] = value_base.to_bytes(4, "little")
+            record[0x28:0x34] = _coord_payload(block)
         if type_code == "t":
             _patch_text_record(record, block)
         elif type_code == "b":
@@ -985,7 +1005,7 @@ def _build_primary_block(
         if type_code in TEXT_POINTER_RECORD_OFFSETS:
             text = _field_text(block, "txt") or ""
             slot_len = _text_slot_len(block)
-            pointer = primary_pre_string_len + 0x14 + string_cursor
+            pointer = primary_pre_string_len + string_pointer_bias + string_cursor
             text_pointer_by_id[object_id] = pointer
             pointer_offset = TEXT_POINTER_RECORD_OFFSETS[type_code]
             record[pointer_offset : pointer_offset + 4] = pointer.to_bytes(4, "little")
@@ -996,14 +1016,16 @@ def _build_primary_block(
             record[0x38:0x3A] = picture_id.to_bytes(2, "little")
         data.extend(record)
 
-    data.extend(b"\x00\x00\x00\x00")
+    if not timer_tail_layout:
+        data.extend(b"\x00\x00\x00\x00")
     for text, slot_len in text_slots:
         encoded = _encode_display_text(text)
         if len(encoded) > slot_len:
             raise TftToolchainError(f"Text {text!r} exceeds compiled text slot length {slot_len}")
         data.extend(encoded.ljust(slot_len, b"\x00"))
     data.extend(b"\x00\x00\x00\x00")
-    return bytes(data), value_offsets, text_pointer_by_id, primary_pre_string_len
+    mirror_pre_string_len = primary_pre_string_len - 4 if timer_tail_layout else primary_pre_string_len
+    return bytes(data), value_offsets, text_pointer_by_id, mirror_pre_string_len
 
 
 def _patch_text_record(record: bytearray, block: PageBlock) -> None:
@@ -1065,6 +1087,15 @@ def _patch_button_record(record: bytearray, block: PageBlock) -> None:
     _write_record_u16_from_field(record, 0x4A, block, "txt_maxl")
 
 
+def _patch_timer_record(record: bytearray, block: PageBlock) -> None:
+    tim = _field_int(block, "tim")
+    if tim is not None:
+        record[0x1C:0x1E] = (tim & 0xFFFF).to_bytes(2, "little")
+    en = _field_int(block, "en")
+    if en is not None:
+        record[0x1E] = en & 0xFF
+
+
 def _write_record_u16_from_field(
     record: bytearray,
     offset: int,
@@ -1114,7 +1145,7 @@ def _build_user_records(
                 word1,
                 word2,
                 template.word3,
-                0x00FF0000 | (object_id << 8),
+                (template.word4 & 0xFFFF00FF) | (object_id << 8),
                 template.word5,
             ]
             slots[template.slot_index] = b"".join(word.to_bytes(4, "little") for word in words)
@@ -1345,11 +1376,11 @@ def _build_mirror_records(
     for index, (block, value_base) in enumerate(zip(target_blocks, value_offsets)):
         type_code = block.type_code
         object_id = _required_field_int(block, "id")
-        record = bytearray(bytes([ord(type_code), object_id, 0, 0x37]) + b"\xFF" * 24)
+        record = bytearray(bytes([ord(type_code), object_id, 0, _record_header_flag(type_code)]) + b"\xFF" * 24)
         record.extend(value_base.to_bytes(4, "little"))
         record.extend(b"\x00\x00\x7F\x00")
         record.extend(b"\x00\x00\x00\x00")
-        record.extend(_coord_payload(block))
+        record.extend(_mirror_coord_payload(block))
         if index == 0:
             event_offset = event_offsets[index] + 4 if image_button_layout else event_offsets[index]
         else:
@@ -1389,7 +1420,15 @@ def _mirror_values_for_block(
         values = list(IMAGE_BUTTON_MIRROR_RELATIVE_VALUES)
     else:
         if descriptor_sequence is not None:
-            values = _mirror_values_by_descriptors(seed, block, descriptor_sequence)
+            layout_templates = seed.mirror_layout_templates.get(mirror_layout_type or "", {})
+            if (
+                mirror_layout_type
+                and descriptor_sequence == seed.mirror_descriptor_sequences.get(mirror_layout_type)
+                and block.type_code in layout_templates
+            ):
+                values = list(layout_templates[block.type_code])
+            else:
+                values = _mirror_values_by_descriptors(seed, block, descriptor_sequence)
         else:
             layout_templates = seed.mirror_layout_templates.get(mirror_layout_type or "", {})
             values = list(layout_templates.get(block.type_code, seed.mirror_templates[block.type_code]))
@@ -1468,6 +1507,7 @@ def _user_record_templates_for_block(
                     word1_delta=template.word1_delta,
                     word2=template.word2,
                     word3=template.word3,
+                    word4=template.word4,
                     word5=template.word5,
                 )
             )
@@ -1562,6 +1602,16 @@ def _coord_payload(block: PageBlock) -> bytes:
             raise TftToolchainError(f"Missing coordinate field {name} in {block.objname}")
         values.append(value)
     return b"".join(value.to_bytes(2, "little") for value in values)
+
+
+def _mirror_coord_payload(block: PageBlock) -> bytes:
+    if block.type_code == TIMER_TYPE_CODE:
+        return bytes.fromhex("00 00 00 00 01 00 01 00 00 00 00 00")
+    return _coord_payload(block)
+
+
+def _record_header_flag(type_code: str) -> int:
+    return TYPE_RECORD_HEADER_FLAGS.get(type_code, 0x37)
 
 
 def _replace_all(buf: memoryview, old: bytes, new: bytes) -> int:

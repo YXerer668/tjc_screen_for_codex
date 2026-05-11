@@ -21,6 +21,7 @@ CASE_12_HMI = Path(r"C:\Users\SinYu\Desktop\case_for_codex\case_12_text_yellow_f
 CASE_12_TFT = Path(r"C:\Users\SinYu\Desktop\case_for_codex\case_12_text_yellow_font0\lcd_test.tft")
 CASE_13_TFT = Path(r"C:\Users\SinYu\Desktop\case_for_codex\case_13_image_button_only\lcd_test.tft")
 CASE_14_TFT = Path(r"C:\Users\SinYu\Desktop\case_for_codex\case_14_text_plus_image_button\lcd_test.tft")
+CASE_19_TFT = Path(r"C:\Users\SinYu\Desktop\case_for_codex\case_19_timer\lcd_test.tft")
 CASE_COMPARE_ROOT = Path(__file__).resolve().parents[1] / "reverse_usarthmi" / "case_compare"
 CASE_14_EXTRACT = CASE_COMPARE_ROOT / "case_14_text_plus_image_button" / "extract"
 
@@ -85,6 +86,48 @@ class EditorTftBuildTests(unittest.TestCase):
             target_page = load_page_file(manifest["target_pa"])
             self.assertEqual([block.objname for block in target_page.blocks[-3:]], ["note1", "btn1", "pic1"])
             self.assertEqual([block.type_code for block in target_page.blocks[-3:]], ["t", "b", "p"])
+
+    @unittest.skipUnless(CASE_19_TFT.exists(), "local official timer fixture is not available")
+    def test_scene_build_emits_timer_tft(self) -> None:
+        scene = validate_scene(
+            {
+                "project": {"name": "timer-scene", "default_page": "page0"},
+                "canvas": {"width": 800, "height": 480, "background_color": 65535},
+                "assets": {},
+                "pages": [
+                    {
+                        "id": "page0",
+                        "layout": {"type": "absolute"},
+                        "widgets": [
+                            {
+                                "id": "tm0",
+                                "type": "timer",
+                                "value": 400,
+                                "style": {"enabled": True},
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifest = build_scene(
+                scene,
+                SEED_HMI,
+                temp_dir,
+                baseline_tft=BASELINE_TFT,
+            )
+            self.assertTrue(Path(manifest["output_tft"]).exists())
+            self.assertTrue(manifest["tft_checksum"]["valid"])
+            self.assertEqual(manifest["tft_patch"]["added_count"], 1)
+
+            target_page = load_page_file(manifest["target_pa"])
+            timer = target_page.blocks[-1]
+            self.assertEqual(timer.objname, "tm0")
+            self.assertEqual(timer.type_code, "3")
+            self.assertEqual(_field_int(timer, "tim"), 400)
+            self.assertEqual(_field_int(timer, "en"), 1)
 
     def test_scene_build_can_move_seed_objects_offscreen(self) -> None:
         scene = validate_scene(

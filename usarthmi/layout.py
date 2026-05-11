@@ -24,26 +24,32 @@ def _resolve_children(widgets: list[WidgetSpec], layout: dict, x: int, y: int, w
     inner_y = y + padding
     inner_w = max(width - 2 * padding, 0)
     inner_h = max(height - 2 * padding, 0)
+    visual_widgets = []
+    for widget in widgets:
+        if _is_nonvisual_widget(widget):
+            _resolve_nonvisual_widget(widget, inner_x, inner_y)
+        else:
+            visual_widgets.append(widget)
 
     if mode == "absolute":
-        for widget in widgets:
+        for widget in visual_widgets:
             _resolve_absolute_widget(widget, inner_x, inner_y, inner_w, inner_h)
         return
 
     if mode == "row":
-        _resolve_row(widgets, inner_x, inner_y, inner_w, inner_h, gap)
+        _resolve_row(visual_widgets, inner_x, inner_y, inner_w, inner_h, gap)
         return
 
     if mode == "column":
-        _resolve_column(widgets, inner_x, inner_y, inner_w, inner_h, gap)
+        _resolve_column(visual_widgets, inner_x, inner_y, inner_w, inner_h, gap)
         return
 
     if mode == "grid":
-        _resolve_grid(widgets, inner_x, inner_y, inner_w, inner_h, gap, layout)
+        _resolve_grid(visual_widgets, inner_x, inner_y, inner_w, inner_h, gap, layout)
         return
 
     if mode == "stack":
-        for widget in widgets:
+        for widget in visual_widgets:
             widget.x = inner_x
             widget.y = inner_y
             widget.w = widget.w if widget.w is not None else inner_w
@@ -52,11 +58,23 @@ def _resolve_children(widgets: list[WidgetSpec], layout: dict, x: int, y: int, w
         return
 
     if mode == "anchor":
-        for widget in widgets:
+        for widget in visual_widgets:
             _resolve_anchor(widget, inner_x, inner_y, inner_w, inner_h)
         return
 
     raise LayoutError(f"Unsupported layout type: {mode}")
+
+
+def _is_nonvisual_widget(widget: WidgetSpec) -> bool:
+    return widget.type == "timer"
+
+
+def _resolve_nonvisual_widget(widget: WidgetSpec, x: int, y: int) -> None:
+    widget.x = x + int(widget.x or 0)
+    widget.y = y + int(widget.y or 0)
+    widget.w = max(int(widget.w or 1), 1)
+    widget.h = max(int(widget.h or 1), 1)
+    _resolve_nested(widget)
 
 
 def _resolve_absolute_widget(widget: WidgetSpec, x: int, y: int, width: int, height: int) -> None:
@@ -183,4 +201,3 @@ def _split_dimension(widgets: Iterable[WidgetSpec], total: int, gap: int, primar
         size = getattr(widget, primary)
         sizes.append(int(size) if size is not None else share)
     return sizes
-

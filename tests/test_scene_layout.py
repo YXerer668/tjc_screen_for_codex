@@ -48,6 +48,17 @@ class SceneLayoutTests(unittest.TestCase):
         self.assertEqual((placed[1].x, placed[1].y), (110, 0))
         self.assertEqual((placed[2].x, placed[2].y), (0, 110))
 
+    def test_timer_layout_is_nonvisual(self) -> None:
+        widgets = [
+            WidgetSpec(id="tm0", type="timer"),
+            WidgetSpec(id="a", type="button", h=30),
+            WidgetSpec(id="b", type="button", h=30),
+        ]
+        placed = resolve_page_layout(widgets, {"type": "row", "gap": 10}, 210, 30)
+        self.assertEqual((placed[0].x, placed[0].y, placed[0].w, placed[0].h), (0, 0, 1, 1))
+        self.assertEqual((placed[1].x, placed[1].w), (0, 100))
+        self.assertEqual((placed[2].x, placed[2].w), (110, 100))
+
     def test_stack_layout(self) -> None:
         widgets = [WidgetSpec(id="bg", type="image"), WidgetSpec(id="fg", type="text")]
         placed = resolve_page_layout(widgets, {"type": "stack"}, 320, 240)
@@ -79,6 +90,33 @@ class SceneLayoutTests(unittest.TestCase):
         self.assertEqual(round_trip.pages[0].events["loadend"], ["vis evtbtn,0"])
         self.assertEqual(round_trip.pages[0].widgets[0].events["slide"], ["printh 23 02 53 4c"])
         self.assertEqual(round_trip.pages[0].widgets[0].events["timer"], ["printh 23 02 54 4d"])
+
+    def test_timer_widget_is_valid_scene_type(self) -> None:
+        scene = validate_scene(
+            {
+                "project": {"name": "timer-scene", "default_page": "page0"},
+                "canvas": {"width": 800, "height": 480},
+                "assets": {},
+                "pages": [
+                    {
+                        "id": "page0",
+                        "layout": {"type": "absolute"},
+                        "widgets": [
+                            {
+                                "id": "tm0",
+                                "type": "timer",
+                                "value": 400,
+                                "style": {"enabled": True},
+                                "events": {"timer": ["printh 23 02 54 4d"]},
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(scene.pages[0].widgets[0].type, "timer")
+        self.assertEqual(scene.pages[0].widgets[0].events["timer"], ["printh 23 02 54 4d"])
 
     def test_scene_preview_renders_png(self) -> None:
         base = Path(__file__).resolve().parents[1] / "examples" / "menu_demo"

@@ -15,7 +15,7 @@ from .preview import render_scene_preview
 from .scene import SceneModel, save_scene_json, widget_to_dict
 from .tft_checksum import inspect_tft_checksum
 from .tft_images import compile_hmi_picture_resource, pack_picture_resources_into_tft
-from .tft_patch import patch_added_object_tft
+from .tft_patch import DEFAULT_CASE_ROOT, patch_added_object_tft
 
 
 class EditorError(RuntimeError):
@@ -179,6 +179,9 @@ def build_hmi(
     template_page_button = load_page_file(r"C:\Program Files (x86)\USART HMI\keyboardch\800480\1.page")
     button_proto = _first_block_of_type(page.blocks, "b") or find_block_by_objname(template_page_button, "b0").clone()
     number_proto = find_block_by_objname(template_page_button, "loadpageid").clone()
+    timer_proto = _first_block_of_type(page.blocks, "3")
+    if timer_proto is None:
+        timer_proto = _load_case_last_block("case_19_timer")
     text_proto = _first_block_of_type(page.blocks, "t")
     if text_proto is None:
         template_page_text = load_page_file(r"C:\Program Files (x86)\USART HMI\keyboardch\800480\2.page")
@@ -215,6 +218,10 @@ def build_hmi(
             _apply_common_widget_fields(block, widget, next_id)
             _apply_textual_fields(block, widget)
             _apply_color_fields(block, widget)
+        elif widget.type == "timer":
+            block = timer_proto.clone()
+            _apply_object_identity_fields(block, widget, next_id)
+            _apply_timer_fields(block, widget)
         else:
             continue
 
@@ -237,8 +244,18 @@ def build_hmi(
 
 
 def _apply_common_widget_fields(block, widget, next_id: int) -> None:
+    _apply_object_identity_fields(block, widget, next_id)
+    if block.type_code == "3":
+        return
+    _apply_geometry_fields(block, widget)
+
+
+def _apply_object_identity_fields(block, widget, next_id: int) -> None:
     block.set_string("objname", widget.id, encoding="ascii")
     block.set_int("id", next_id, width=1)
+
+
+def _apply_geometry_fields(block, widget) -> None:
     block.set_int("x", int(widget.x or 0), width=2)
     block.set_int("y", int(widget.y or 0), width=2)
     block.set_int("w", int(widget.w or 0), width=2)
@@ -263,6 +280,19 @@ def _move_seed_objects_offscreen(blocks, *, width: int, height: int) -> None:
 
 def _first_block_of_type(blocks, type_code: str):
     return next((block.clone() for block in blocks if block.type_code == type_code), None)
+
+
+def _load_case_last_block(case_name: str):
+    hmi_path = DEFAULT_CASE_ROOT / case_name / "lcd_test.HMI"
+    if not hmi_path.exists():
+        raise EditorError(
+            f"Timer/widget template fixture is missing: {hmi_path}. "
+            "Provide local case fixtures or avoid this widget type for now."
+        )
+    inspection = inspect_hmi(hmi_path)
+    raw = hmi_path.read_bytes()
+    entry = next(item for item in inspection.entries if item.name == "0.pa")
+    return parse_page_data(raw[entry.data_offset : entry.data_offset + entry.length]).blocks[-1].clone()
 
 
 def _apply_textual_fields(block, widget) -> None:
@@ -351,6 +381,15 @@ def _apply_picture_fields(block, widget, manifest_assets: dict[str, Any]) -> Non
         block.set_int("pic", int(explicit_pic), width=2)
         return
     _apply_asset_fields(block, widget, manifest_assets)
+
+
+def _apply_timer_fields(block, widget) -> None:
+    tim = widget.style.get("tim", widget.style.get("interval_ms", widget.value))
+    if tim is not None:
+        block.set_int("tim", int(tim), width=2)
+    en = widget.style.get("en", widget.style.get("enabled"))
+    if en is not None:
+        block.set_int("en", 1 if bool(en) else 0, width=1)
 
 
 def _apply_event_fields(block, events: dict[str, list[str]], *, owner: str) -> None:
@@ -536,10 +575,10 @@ def _validate_tft_target_support(
     allowed_pics = existing_pics | packed_pics
     added_blocks = target_page.blocks[len(baseline_page.blocks) :]
     for block in added_blocks:
-        if block.type_code not in {"t", "b", "p"}:
+        if block.type_code not in {"t", "b", "p", "3"}:
             raise EditorError(
-                "TFT scene build currently supports only appended text/button/image widgets "
-                f"compiled as t/b/p; object {block.objname!r} has type {block.type_code!r}"
+                "TFT scene build currently supports only appended text/button/image/timer widgets "
+                f"compiled as t/b/p/3; object {block.objname!r} has type {block.type_code!r}"
             )
         for field_name in ("pic", "picc", "pic2", "picc2"):
             value = _block_int(block, field_name)

@@ -277,6 +277,26 @@ class TftPatchTests(unittest.TestCase):
             info = inspect_tft_checksum(out)
             self.assertTrue(info["valid"])
 
+    @unittest.skipUnless(
+        (CASE_ROOT / "case_19_timer" / "lcd_test.tft").exists()
+        and (EXTRACT_ROOT / "case_19_timer" / "extract" / "0.pa").exists(),
+        "local timer fixture is not available",
+    )
+    def test_added_object_patch_reproduces_timer_case_exactly(self) -> None:
+        baseline_tft = CASE_ROOT / "case_00_baseline" / "lcd_test.tft"
+        baseline_pa = EXTRACT_ROOT / "case_00_baseline" / "extract" / "0.pa"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out = Path(temp_dir) / "case_19_timer.tft"
+
+            patch_added_object_tft(
+                baseline_tft,
+                baseline_pa=baseline_pa,
+                target_pa=EXTRACT_ROOT / "case_19_timer" / "extract" / "0.pa",
+                out_tft=out,
+            )
+
+            self.assertEqual(out.read_bytes(), (CASE_ROOT / "case_19_timer" / "lcd_test.tft").read_bytes())
+
     def test_added_object_patch_keeps_qrcode_text_pointer_separate(self) -> None:
         baseline_tft = CASE_ROOT / "case_00_baseline" / "lcd_test.tft"
         baseline_pa = EXTRACT_ROOT / "case_00_baseline" / "extract" / "0.pa"

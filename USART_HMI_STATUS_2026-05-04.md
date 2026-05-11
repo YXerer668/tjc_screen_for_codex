@@ -1496,3 +1496,60 @@ Until that step is complete, all screen changes remain either:
 - Regression tests:
   - `python -m pytest tests\test_tft_patch.py tests\test_editor_tft_build.py tests\test_page_format.py tests\test_scene_layout.py -q`
   - Result: `36 passed, 22 subtests passed`
+
+## Finding: Timer Non-Visual Control 2026-05-11
+
+- Status:
+  - `timer` / `tm0` is now supported as a non-visual scene widget and appended TFT object.
+  - It is intentionally not treated as a visible widget; the preview and layout layers give it a safe `1x1` authoring placeholder, but it does not consume row/grid/stack layout space.
+- Recovered compiled details:
+  - HMI type code: `3`.
+  - Primary record length: `0x24`.
+  - User slot count: `11`.
+  - Primary and mirror record header flag byte: `0x27`.
+  - Mirror pseudo geometry payload: `00 00 00 00 01 00 01 00 00 00 00 00`.
+  - Timer tail layout omits the normal pre-string sentinel and uses string pointer bias `0x10`.
+  - The timer extra code block is `09 1f 04 34`.
+  - Timer object fields verified in HMI/source model: `tim`, `en`, event token `codestimer-0`.
+- Tooling changes:
+  - `scene` validation accepts widget type `timer`.
+  - `editor.build_scene` can clone the official local `case_19_timer` template when the seed does not already contain a timer.
+  - `tft_patch.patch_added_object_tft` can emit appended timer objects.
+  - CLI authoring includes `usarthmi hmi add-timer`; timer no longer requires visual `x/y/w/h`.
+  - Example scene added: `examples\timer_demo\scene.json`.
+  - Event probe scene added: `examples\timer_demo\scene_printh.json`.
+- Generated artifacts:
+  - `reverse_usarthmi\extra_controls_demo\timer_scene_build\output.hmi`
+  - `reverse_usarthmi\extra_controls_demo\timer_scene_build\output.tft`
+  - `reverse_usarthmi\extra_controls_demo\timer_scene_build\manifest.json`
+  - `reverse_usarthmi\extra_controls_demo\timer_scene_build\upload_timer.json`
+- Build verification:
+  - CLI build command produced a valid TFT checksum: `0x97734E5A`.
+  - Added object summary: `tm0`, type `3`, id `4`, `tim=400`, `en=1`.
+  - Earlier direct patch reproduction of `case_19_timer` is byte-for-byte equal to the official fixture when using the extracted official target `0.pa`.
+- Live validation on `COM36`:
+  - Uploaded `reverse_usarthmi\extra_controls_demo\timer_scene_build\output.tft`.
+  - File size: `11,408,652` bytes.
+  - Upload chunks: `2786`.
+  - Elapsed upload time: `210.344s`.
+  - Runtime reads:
+    - `sendme -> 0`
+    - `get tm0.tim -> 400`
+    - `get tm0.en -> 1`
+  - Runtime writes:
+    - `tm0.en=0`, then `get tm0.en -> 0`
+    - `tm0.tim=250`, then `get tm0.tim -> 250`
+  - Restored `tm0.en=1` and `tm0.tim=400`.
+- Timer event probe:
+  - Built and uploaded `reverse_usarthmi\extra_controls_demo\timer_printh_build\output.tft`.
+  - Event source was `codestimer-1` with `printh 23 02 54 4d`.
+  - Serial passive listen before and after `tm0.en=1` received no `23 02 54 4d` frames.
+  - This means `timer` object/property compilation works, but timer event scheduling is still not proven and likely needs another compiled scheduler/index table.
+  - Evidence:
+    - `reverse_usarthmi\extra_controls_demo\timer_printh_build\verify_timer_printh.json`
+    - `reverse_usarthmi\extra_controls_demo\timer_printh_build\verify_timer_printh_after_enable.json`
+- Current limit:
+  - Timer event scheduling remains unsolved. The next useful fixture is an official `timer + text/number/printh witness` compiled TFT, so the runtime scheduler/index delta can be diffed directly.
+- Regression tests:
+  - `python -m pytest tests\test_tft_patch.py tests\test_scene_layout.py tests\test_editor_tft_build.py -q`
+  - Result after CLI timer fix: `40 passed, 22 subtests passed`
