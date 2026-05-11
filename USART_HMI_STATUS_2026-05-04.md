@@ -1851,3 +1851,56 @@ Until that step is complete, all screen changes remain either:
   - `python -m py_compile tools\live_case_smoke.py tests\test_tft_patch.py usarthmi\tft_patch.py`
   - `python -m pytest tests\test_tft_patch.py tests\test_protocol.py -q`
   - Result: `34 passed, 33 subtests passed`.
+
+## Milestone: Minimal Control Live Matrix Case16-30 2026-05-11
+
+- Scope:
+  - Goal: prove each minimal single-control page is not only checksum-valid, but also live on the real `COM36` screen.
+  - Method: build clean TFT, upload or skip when identical, run `sendme`, confirm old seed objects `t0/b0/p0` are invalid, then run the smallest meaningful property/action check for the target object.
+  - Camera captures were stored under `reverse_usarthmi\minimal_control_live\<case>\camera_after_upload.jpg`.
+- Smoke tool hardening:
+  - Text-like controls now write `txt="OK"` and read it back for `t/b/5/7/C/:`.
+  - Numeric visual controls now write `val=37` and read it back for slider, number, progress bar, and gauge.
+  - Timer checks now read `tim/en`, set `en=1`, and read it back.
+  - Variable checks now write `val=123` and read it back.
+  - Hotspot checks now issue `click m0,1` and require no invalid-object response.
+  - Picture/crop-image checks now read and rewrite `pic` or `picc`; crop image `q0.picc=65535` was confirmed live.
+- Live verified controls:
+  - `case_16_number_basic`: `numval.val=37` read back as `37`; camera shows `00037`.
+  - `case_17_slider`: `slider1.val=37` read back as `37`.
+  - `case_18_gauge`: `gauge1.val=37` read back as `37`.
+  - `case_19_timer`: `tm0.tim -> 400`, `tm0.en=1` read back as `1`.
+  - `case_20_progress`: `bar1.val=37` read back as `37`.
+  - `case_21_qrcode`: `qr1.txt="OK"` read back as `OK`.
+  - `case_22_scrolling_text`: `g0.txt="OK"` read back as `OK`.
+  - `case_23_dual_state_button`: `bt0.txt="OK"` read back as `OK`; click changed `bt0.val` to `1`.
+  - `case_24_state_button`: `sw0.txt="OK"` read back as `OK`; click changed `sw0.val` to `1`.
+  - `case_25_hotspot_touch_area`: `m0.x -> 0`; `click m0,1` accepted.
+  - `case_26_variable_numeric_string`: `va0.val=123` read back as `123`; `va1` is also reachable.
+  - `case_27_waveform_basic`: `b1.txt="OK"` read back as `OK`; click changed `b1.val` to `1`; `add s0.id,0,50` accepted.
+  - `case_28_checkbox`: click changed `c0.val` from `1` to `0`.
+  - `case_29_radio`: `r0/r1` reachable; click changed `r0.val` from `1` to `0`.
+  - `case_30_crop_image`: `q0.x -> 0`; `q0.picc -> 65535`; `q0.picc=65535` read back as `65535`.
+- Evidence files:
+  - `reverse_usarthmi\minimal_control_live_case16.json`
+  - `reverse_usarthmi\minimal_control_live_case17.json`
+  - `reverse_usarthmi\minimal_control_live_case18.json`
+  - `reverse_usarthmi\minimal_control_live_case19.json`
+  - `reverse_usarthmi\minimal_control_live_case20.json`
+  - `reverse_usarthmi\minimal_control_live_case21.json`
+  - `reverse_usarthmi\minimal_control_live_case22.json`
+  - `reverse_usarthmi\minimal_control_live_case23.json`
+  - `reverse_usarthmi\minimal_control_live_case24.json`
+  - `reverse_usarthmi\minimal_control_live_case25.json`
+  - `reverse_usarthmi\minimal_control_live_case26.json`
+  - `reverse_usarthmi\minimal_control_live_case27.json`
+  - `reverse_usarthmi\minimal_control_live_case28.json`
+  - `reverse_usarthmi\minimal_control_live_case29.json`
+  - `reverse_usarthmi\minimal_control_live_case30_rerun.json`
+- Boundary note:
+  - This milestone proves minimal object/property/action survival on `page0`.
+  - `case_31+` should be treated separately because page lifecycle, page table, real event side effects, timer scheduling, and cold boot persistence can still produce false positives if only "command did not error" is checked.
+- Regression:
+  - `python -m py_compile tools\live_case_smoke.py`
+  - `python -m pytest tests\test_tft_patch.py tests\test_protocol.py -q`
+  - Result: `34 passed, 33 subtests passed`.

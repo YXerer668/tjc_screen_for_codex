@@ -37,6 +37,10 @@ DEFAULT_OLD_GETS = {
     "b0": "txt",
     "p0": "pic",
 }
+TEXT_READBACK_TYPES = {"t", "b", "5", "7", "C", ":"}
+IMAGE_RESOURCE_TYPES = {"p", "q"}
+IMAGE_RESOURCE_FIELDS = ("pic", "picc")
+HOTSPOT_CLICK_TYPES = {"m"}
 
 
 @dataclass(slots=True)
@@ -276,6 +280,75 @@ def _run_serial_checks(
         )
 
     for block in target_blocks:
+        if not block.objname or block.type_code not in IMAGE_RESOURCE_TYPES:
+            continue
+        name = block.objname
+        for attr in IMAGE_RESOURCE_FIELDS:
+            if block.get_field(attr) is None:
+                continue
+            checks.append(
+                _transact_check(
+                    transport,
+                    build_get(f"{name}.{attr}"),
+                    lambda response: response.kind == "number",
+                    f"image {attr} resource must be readable",
+                )
+            )
+            pic_id = _field_int(block, attr)
+            if pic_id is None:
+                continue
+            checks.append(
+                _transact_check(
+                    transport,
+                    build_set(f"{name}.{attr}", str(pic_id)),
+                    lambda response: response.kind in {"none", "number", "unknown", "ascii"},
+                    f"image {attr} assignment should not be invalid",
+                )
+            )
+            checks.append(
+                _transact_check(
+                    transport,
+                    build_get(f"{name}.{attr}"),
+                    lambda response, expected=pic_id: response.kind == "number" and response.value == expected,
+                    f"image {attr} readback should match assignment",
+                )
+            )
+
+    for block in target_blocks:
+        if not block.objname or block.type_code not in HOTSPOT_CLICK_TYPES:
+            continue
+        checks.append(
+            _transact_check(
+                transport,
+                build_click(block.objname, "down"),
+                lambda response: response.kind in {"none", "number", "string", "ascii", "unknown"},
+                "hotspot click down should not be invalid",
+                attempts=1,
+            )
+        )
+
+    for block in target_blocks:
+        if not block.objname or block.type_code not in TEXT_READBACK_TYPES or block.get_field("txt") is None:
+            continue
+        name = block.objname
+        checks.append(
+            _transact_check(
+                transport,
+                build_set(f"{name}.txt", '"OK"'),
+                lambda response: response.kind in {"none", "number", "unknown", "ascii"},
+                "text assignment should not be invalid",
+            )
+        )
+        checks.append(
+            _transact_check(
+                transport,
+                build_get(f"{name}.txt"),
+                lambda response: response.kind == "string" and response.value == "OK",
+                "text readback should match assignment",
+            )
+        )
+
+    for block in target_blocks:
         if not block.objname or block.get_field("val") is None or block.type_code not in {"5", "C", "8", "9", "b"}:
             continue
         name = block.objname
@@ -304,6 +377,60 @@ def _run_serial_checks(
             )
         )
         break
+
+    for block in target_blocks:
+        if not block.objname or block.get_field("val") is None or block.type_code not in {"\x01", "6", "j", "z"}:
+            continue
+        name = block.objname
+        checks.append(
+            _transact_check(
+                transport,
+                build_set(f"{name}.val", "37"),
+                lambda response: response.kind in {"none", "number", "unknown", "ascii"},
+                "numeric visual val assignment should not be invalid",
+            )
+        )
+        checks.append(
+            _transact_check(
+                transport,
+                build_get(f"{name}.val"),
+                lambda response: response.kind == "number" and response.value == 37,
+                "numeric visual val readback should match assignment",
+            )
+        )
+
+    for block in target_blocks:
+        if not block.objname or block.type_code != "3":
+            continue
+        name = block.objname
+        for attr in ("tim", "en"):
+            if block.get_field(attr) is None:
+                continue
+            checks.append(
+                _transact_check(
+                    transport,
+                    build_get(f"{name}.{attr}"),
+                    lambda response: response.kind == "number",
+                    f"timer {attr} must be readable",
+                )
+            )
+        if block.get_field("en") is not None:
+            checks.append(
+                _transact_check(
+                    transport,
+                    build_set(f"{name}.en", "1"),
+                    lambda response: response.kind in {"none", "number", "unknown", "ascii"},
+                    "timer en assignment should not be invalid",
+                )
+            )
+            checks.append(
+                _transact_check(
+                    transport,
+                    build_get(f"{name}.en"),
+                    lambda response: response.kind == "number" and response.value == 1,
+                    "timer en readback should match assignment",
+                )
+            )
 
     for block in target_blocks:
         if not block.objname or block.type_code != "4" or block.get_field("val") is None:
