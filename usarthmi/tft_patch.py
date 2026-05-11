@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -18,10 +19,10 @@ TYPE_RECORD_LENGTHS = {
     "t": 0x54,
     "b": 0x54,
     "p": 0x3C,
-    "\x01": 0x58,  # slider
-    "z": 0x54,  # gauge
-    "j": 0x44,  # progress bar
-    ":": 0x4C,  # QR code
+    "\x01": 0x54,  # slider
+    "z": 0x50,  # gauge
+    "j": 0x40,  # progress bar
+    ":": 0x48,  # QR code
 }
 TYPE_USER_SLOT_COUNTS = {
     "y": 33,
@@ -198,10 +199,13 @@ class _TailSeed:
     prefix_head: bytes
     page_event: bytes
     object_event: bytes
+    compiled_prefix: bytes
+    prefix_inserts: dict[str, list[tuple[int, bytes]]]
     user_header: bytes
     primary_templates: dict[str, bytes]
     user_templates: dict[str, list[_UserRecordTemplate]]
     mirror_templates: dict[str, list[int | None]]
+    mirror_layout_templates: dict[str, dict[str, list[int | None]]]
     hash_by_name: dict[str, int]
 
 
@@ -334,6 +338,7 @@ def patch_added_object_tft(
 
     seed = _load_tail_seed(baseline_tft_path, baseline_pa_path, baseline_page)
     _augment_seed_templates(seed, {block.type_code for block in target_page.blocks})
+    _validate_extra_layout_mix(seed, target_page.blocks)
     tail, sections = _build_added_object_tail(seed, target_page.blocks)
     payload = bytearray(seed.raw[: seed.object_start] + tail)
     image_button_layout = _uses_full_image_button_layout(target_page.blocks)
@@ -347,6 +352,7 @@ def patch_added_object_tft(
         attr_relative=sections["attr"],
         user_relative=sections["user"],
         picture_relative=sections["pic"],
+        prefix_delta=sections["prefix_delta"],
         image_button_layout=image_button_layout,
     )
 
@@ -419,6 +425,22 @@ def _validate_unique_names_and_ids(blocks: list[PageBlock]) -> None:
         ids[object_id] = name
 
 
+def _validate_extra_layout_mix(seed: _TailSeed, blocks: list[PageBlock]) -> None:
+    extra_types = sorted({
+        block.type_code
+        for block in blocks
+        if block.type_code in seed.mirror_layout_templates
+    })
+    if len(extra_types) <= 1:
+        return
+    readable = ", ".join(repr(item) for item in extra_types)
+    raise TftToolchainError(
+        "Mixed advanced extra-control TFT layouts are not supported yet: "
+        f"{readable}. Build one advanced control type per page/TFT for now, "
+        "or provide an official mixed-control fixture so the combined prefix/mirror layout can be learned."
+    )
+
+
 def _added_block_summary(block: PageBlock) -> dict[str, Any]:
     return {
         "name": block.objname or "",
@@ -438,6 +460,7 @@ def _augment_seed_templates(seed: _TailSeed, needed_types: set[str]) -> None:
 
     case_root = Path(DEFAULT_CASE_ROOT)
     loaded_roots: dict[str, _TailSeed] = {}
+    loaded_pages: dict[str, Any] = {}
     unresolved: list[str] = []
     for type_code in missing:
         case_name = KNOWN_EXTRA_TYPE_CASES.get(type_code)
@@ -455,11 +478,19 @@ def _augment_seed_templates(seed: _TailSeed, needed_types: set[str]) -> None:
             case_page = _load_hmi_page0(case_hmi)
             case_seed = _load_tail_seed(case_tft, case_hmi, case_page)
             loaded_roots[case_name] = case_seed
+            loaded_pages[case_name] = case_page
+        else:
+            case_page = loaded_pages[case_name]
 
         if type_code in case_seed.primary_templates:
             seed.primary_templates[type_code] = case_seed.primary_templates[type_code]
             seed.user_templates[type_code] = case_seed.user_templates[type_code]
             seed.mirror_templates[type_code] = case_seed.mirror_templates[type_code]
+            seed.mirror_layout_templates[type_code] = {
+                key: list(value)
+                for key, value in case_seed.mirror_templates.items()
+            }
+            seed.prefix_inserts[type_code] = _derive_prefix_insertions_for_case(seed, case_seed, case_page)
         else:
             unresolved.append(type_code)
 
@@ -517,6 +548,7 @@ def _load_tail_seed(
         if object_id is not None and name
     }
     baseline_hash_offset, hash_data = _find_hash_block(tail, expected_hash_by_id)
+    compiled_prefix = tail[:baseline_hash_offset]
     hash_by_name: dict[str, int] = {}
     for offset in range(0, len(hash_data), 6):
         object_hash = int.from_bytes(hash_data[offset : offset + 4], "little")
@@ -583,14 +615,22 @@ def _load_tail_seed(
 
     mirror_start = picture_start - object_start
     mirror_templates: dict[str, list[int | None]] = {}
+    mirror_offsets = _find_mirror_record_offsets(tail, mirror_start, baseline_page.blocks)
     slot_start = 0
     for index, block in enumerate(baseline_page.blocks):
         type_code = block.type_code
-        record = tail[mirror_start + 0x10 + index * 0x8A : mirror_start + 0x10 + (index + 1) * 0x8A]
-        if len(record) != 0x8A:
+        record_start = mirror_offsets[index]
+        if index + 1 < len(mirror_offsets):
+            record_end = mirror_offsets[index + 1]
+        elif index > 0:
+            record_end = record_start + (mirror_offsets[index] - mirror_offsets[index - 1])
+        else:
+            record_end = record_start + 0x8A
+        record = tail[record_start:record_end]
+        if len(record) < 0x8A or (len(record) - 0x38) % 2:
             raise TftToolchainError("Baseline mirror object record is truncated")
         values: list[int | None] = []
-        for offset in range(0x38, 0x8A, 2):
+        for offset in range(0x38, len(record), 2):
             value = int.from_bytes(record[offset : offset + 2], "little")
             values.append(None if value == 0xFFFF else value - slot_start)
         mirror_templates.setdefault(type_code, values)
@@ -606,10 +646,13 @@ def _load_tail_seed(
         prefix_head=prefix_head,
         page_event=page_event,
         object_event=object_event,
+        compiled_prefix=compiled_prefix,
+        prefix_inserts={},
         user_header=user_header,
         primary_templates=primary_templates,
         user_templates=user_templates,
         mirror_templates=mirror_templates,
+        mirror_layout_templates={},
         hash_by_name=hash_by_name,
     )
 
@@ -635,13 +678,35 @@ def _find_hash_block(tail: bytes, expected_hash_by_id: dict[int, int]) -> tuple[
     raise TftToolchainError("Unable to locate compiled TFT object hash/index block")
 
 
+def _find_mirror_record_offsets(tail: bytes, mirror_start: int, blocks: list[PageBlock]) -> list[int]:
+    offsets: list[int] = []
+    cursor = mirror_start + 0x10
+    for block in blocks:
+        type_code = block.type_code
+        object_id = _required_field_int(block, "id")
+        header = bytes([ord(type_code), object_id, 0, 0x37])
+        found = tail.find(header, cursor, min(len(tail), cursor + 0x400))
+        if found < 0:
+            raise TftToolchainError(
+                f"Unable to locate mirror record for {block.objname or type_code!r}"
+            )
+        offsets.append(found)
+        cursor = found + 0x38
+    return offsets
+
+
 def _build_added_object_tail(
     seed: _TailSeed,
     target_blocks: list[PageBlock],
 ) -> tuple[bytes, dict[str, int]]:
     object_count = len(target_blocks)
     image_button_layout = _uses_full_image_button_layout(target_blocks)
-    prefix_head = _prefix_head_for_layout(seed.prefix_head, image_button_layout=image_button_layout)
+    mirror_layout_type = _mirror_layout_type_for_blocks(seed, target_blocks)
+    prefix_head = _prefix_head_for_layout(
+        seed.prefix_head,
+        image_button_layout=image_button_layout,
+        extra_insertions=_prefix_insertions_for_blocks(seed, target_blocks),
+    )
     event_layout = _build_event_layout(target_blocks, len(prefix_head), image_button_layout=image_button_layout)
     prefix = prefix_head + event_layout.data
     hash_offset = len(prefix)
@@ -667,6 +732,8 @@ def _build_added_object_tail(
         target_blocks,
     )
     out.extend(_code_block(primary_data))
+    if any(block.type_code == "\x01" for block in target_blocks):
+        out.extend(_code_block(bytes.fromhex("09 1f 04 34")))
     out.extend(_code_block(b"\x09\x30\x08"))
     out.extend(_code_block(b""))
 
@@ -689,6 +756,13 @@ def _build_added_object_tail(
             seed,
             target_blocks,
             value_offsets,
+            mirror_layout_type=mirror_layout_type,
+            mirror_value_count=_mirror_value_count_for_layout(
+                seed,
+                target_blocks,
+                image_button_layout=image_button_layout,
+                mirror_layout_type=mirror_layout_type,
+            ),
             hash_offset=hash_offset,
             user_offset=user_offset,
             primary_pre_string_len=primary_pre_string_len,
@@ -709,6 +783,7 @@ def _build_added_object_tail(
         "user": user_offset,
         "pic": picture_offset,
         "padding": padding_offset,
+        "prefix_delta": int.from_bytes(prefix_head[:4], "little") - int.from_bytes(seed.prefix_head[:4], "little"),
         "tail": len(out),
     }
 
@@ -1053,24 +1128,127 @@ def _uses_full_image_button_layout(blocks: list[PageBlock]) -> bool:
     return any(block.type_code == "b" and _field_int(block, "sta") == 2 for block in blocks)
 
 
-def _prefix_head_for_layout(prefix_head: bytes, *, image_button_layout: bool) -> bytes:
-    if not image_button_layout:
-        return prefix_head
-    if len(prefix_head) <= IMAGE_BUTTON_PREFIX_INSERT_OFFSET + len(IMAGE_BUTTON_PREFIX_INSERT):
-        raise TftToolchainError("TFT prefix template is too short for image-button layout patch")
-    if prefix_head[
-        IMAGE_BUTTON_PREFIX_INSERT_OFFSET : IMAGE_BUTTON_PREFIX_INSERT_OFFSET + len(IMAGE_BUTTON_PREFIX_INSERT)
-    ] == IMAGE_BUTTON_PREFIX_INSERT:
-        return prefix_head
+def _prefix_insertions_for_blocks(seed: _TailSeed, blocks: list[PageBlock]) -> list[tuple[int, bytes]]:
+    insertions: list[tuple[int, bytes]] = []
+    for type_code in sorted({block.type_code for block in blocks}):
+        insertions.extend(seed.prefix_inserts.get(type_code, []))
+    return insertions
 
-    patched = bytearray(
-        prefix_head[:IMAGE_BUTTON_PREFIX_INSERT_OFFSET]
-        + IMAGE_BUTTON_PREFIX_INSERT
-        + prefix_head[IMAGE_BUTTON_PREFIX_INSERT_OFFSET:]
+
+def _derive_prefix_insertions_for_case(
+    seed: _TailSeed,
+    case_seed: _TailSeed,
+    case_page: Any,
+) -> list[tuple[int, bytes]]:
+    image_button_layout = _uses_full_image_button_layout(case_page.blocks)
+    generated_head = _prefix_head_for_layout(
+        seed.prefix_head,
+        image_button_layout=image_button_layout,
+        extra_insertions=[],
     )
-    del patched[len(prefix_head) :]
-    _add_prefix_u32(patched, 0x00, 4)
-    _add_prefix_u32(patched, 0x24, 4)
+    generated_layout = _build_event_layout(
+        case_page.blocks,
+        len(generated_head),
+        image_button_layout=image_button_layout,
+    )
+    generated_prefix = generated_head + generated_layout.data
+    actual_prefix = case_seed.compiled_prefix
+
+    insertions: list[tuple[int, bytes]] = []
+    matcher = SequenceMatcher(None, generated_prefix, actual_prefix, autojunk=False)
+    for tag, first_start, first_end, second_start, second_end in matcher.get_opcodes():
+        if tag == "insert":
+            insertions.append((first_start, actual_prefix[second_start:second_end]))
+
+    patched = _apply_prefix_insertions(generated_prefix, insertions)
+    if patched != actual_prefix:
+        raise TftToolchainError(
+            f"Unable to derive exact TFT prefix insertions from {case_seed.baseline_tft}"
+        )
+    return insertions
+
+
+def _mirror_layout_type_for_blocks(seed: _TailSeed, blocks: list[PageBlock]) -> str | None:
+    candidates = [
+        block.type_code
+        for block in blocks
+        if block.type_code in seed.mirror_layout_templates
+    ]
+    if not candidates:
+        return None
+    return max(
+        sorted(set(candidates)),
+        key=lambda type_code: max(len(values) for values in seed.mirror_layout_templates[type_code].values()),
+    )
+
+
+def _mirror_value_count_for_layout(
+    seed: _TailSeed,
+    blocks: list[PageBlock],
+    *,
+    image_button_layout: bool,
+    mirror_layout_type: str | None,
+) -> int:
+    layout_templates = seed.mirror_layout_templates.get(mirror_layout_type or "", {})
+    widths = [
+        len(layout_templates.get(block.type_code, seed.mirror_templates[block.type_code]))
+        for block in blocks
+    ]
+    if image_button_layout:
+        widths.append(IMAGE_BUTTON_MIRROR_VALUE_COUNT)
+    return max(widths, default=MIRROR_VALUE_COUNT)
+
+
+def _prefix_head_for_layout(
+    prefix_head: bytes,
+    *,
+    image_button_layout: bool,
+    extra_insertions: list[tuple[int, bytes]],
+) -> bytes:
+    patched = _apply_prefix_insertions(prefix_head, list(extra_insertions))
+    if not image_button_layout:
+        return patched
+    offset = IMAGE_BUTTON_PREFIX_INSERT_OFFSET + _prefix_inserted_bytes_before(
+        extra_insertions,
+        IMAGE_BUTTON_PREFIX_INSERT_OFFSET,
+    )
+    if len(patched) <= offset + len(IMAGE_BUTTON_PREFIX_INSERT):
+        raise TftToolchainError("TFT prefix template is too short for image-button layout patch")
+    if patched[offset : offset + len(IMAGE_BUTTON_PREFIX_INSERT)] == IMAGE_BUTTON_PREFIX_INSERT:
+        return patched
+
+    out = bytearray(
+        patched[:offset]
+        + IMAGE_BUTTON_PREFIX_INSERT
+        + patched[offset:]
+    )
+    del out[len(patched) :]
+    _add_prefix_u32(out, 0x00, 4)
+    _add_prefix_u32(out, 0x24, 4)
+    return bytes(out)
+
+
+def _prefix_inserted_bytes_before(insertions: list[tuple[int, bytes]], offset: int) -> int:
+    return sum(len(payload) for item_offset, payload in set(insertions) if item_offset < offset)
+
+
+def _apply_prefix_insertions(prefix: bytes, insertions: list[tuple[int, bytes]]) -> bytes:
+    if not insertions:
+        return prefix
+    deduped = sorted(set(insertions), key=lambda item: (item[0], item[1]))
+    patched = bytearray(prefix)
+    shift = 0
+    for offset, payload in deduped:
+        if not payload:
+            continue
+        if offset < 0 or offset > len(prefix):
+            raise TftToolchainError(f"TFT prefix insertion offset out of range: 0x{offset:X}")
+        cursor = offset + shift
+        patched[cursor:cursor] = payload
+        shift += len(payload)
+    if shift:
+        _add_prefix_u32(patched, 0x00, shift)
+        _add_prefix_u32(patched, 0x24, shift)
     return bytes(patched)
 
 
@@ -1100,6 +1278,8 @@ def _build_mirror_records(
     target_blocks: list[PageBlock],
     value_offsets: list[int],
     *,
+    mirror_layout_type: str | None,
+    mirror_value_count: int,
     hash_offset: int,
     user_offset: int,
     primary_pre_string_len: int,
@@ -1126,12 +1306,16 @@ def _build_mirror_records(
         else:
             event_offset = event_offsets[index]
         record.extend(event_offset.to_bytes(4, "little"))
-        for item in _mirror_values_for_block(seed, block, image_button_layout=image_button_layout):
+        for item in _mirror_values_for_block(
+            seed,
+            block,
+            image_button_layout=image_button_layout,
+            mirror_layout_type=mirror_layout_type,
+            mirror_value_count=mirror_value_count,
+        ):
             value = 0xFFFF if item is None else slot_start + item
             record.extend(value.to_bytes(2, "little"))
-        expected_length = 0x38 + (
-            IMAGE_BUTTON_MIRROR_VALUE_COUNT if image_button_layout else MIRROR_VALUE_COUNT
-        ) * 2
+        expected_length = 0x38 + mirror_value_count * 2
         if len(record) != expected_length:
             raise TftToolchainError(
                 f"Internal mirror record length mismatch for {block.objname}: "
@@ -1147,17 +1331,23 @@ def _mirror_values_for_block(
     block: PageBlock,
     *,
     image_button_layout: bool,
+    mirror_layout_type: str | None,
+    mirror_value_count: int,
 ) -> list[int | None]:
     if image_button_layout and block.type_code == "b" and _field_int(block, "sta") == 2:
-        return list(IMAGE_BUTTON_MIRROR_RELATIVE_VALUES)
-
-    values = list(seed.mirror_templates[block.type_code])
-    if len(values) != MIRROR_VALUE_COUNT:
+        values = list(IMAGE_BUTTON_MIRROR_RELATIVE_VALUES)
+    else:
+        layout_templates = seed.mirror_layout_templates.get(mirror_layout_type or "", {})
+        values = list(layout_templates.get(block.type_code, seed.mirror_templates[block.type_code]))
+        if image_button_layout:
+            values.insert(IMAGE_BUTTON_MIRROR_EXTRA_INDEX, None)
+    if len(values) > mirror_value_count:
         raise TftToolchainError(
-            f"Unexpected mirror template width for {block.objname}: {len(values)}"
+            f"Unexpected mirror template width for {block.objname}: "
+            f"{len(values)} > layout width {mirror_value_count}"
         )
-    if image_button_layout:
-        values.insert(IMAGE_BUTTON_MIRROR_EXTRA_INDEX, None)
+    if len(values) < mirror_value_count:
+        values.extend([None] * (mirror_value_count - len(values)))
     return values
 
 
@@ -1209,6 +1399,7 @@ def _refresh_tft_headers(
     attr_relative: int,
     user_relative: int,
     picture_relative: int,
+    prefix_delta: int = 0,
     image_button_layout: bool = False,
 ) -> None:
     raw = bytearray(payload)
@@ -1225,13 +1416,13 @@ def _refresh_tft_headers(
     picture_absolute = object_start + picture_relative
     _write_header2_field(raw, key, HEADER2_FIELD_OFFSETS["pictures_address"], picture_absolute.to_bytes(4, "little"))
     _write_header2_field(raw, key, HEADER2_FIELD_OFFSETS["gmovs_address"], (picture_absolute + 0x10).to_bytes(4, "little"))
-    if image_button_layout:
+    if prefix_delta:
         current = _read_header2_u16(raw, key, HEADER2_FIELD_OFFSETS["image_button_prefix_count"])
         _write_header2_field(
             raw,
             key,
             HEADER2_FIELD_OFFSETS["image_button_prefix_count"],
-            (current + 4).to_bytes(2, "little"),
+            (current + prefix_delta).to_bytes(2, "little"),
         )
     _write_header2_field(raw, key, HEADER2_FIELD_OFFSETS["compiled_object_count"], object_count.to_bytes(2, "little"))
     raw[HEADER2_CRC_OFFSET : HEADER2_CRC_OFFSET + 4] = _crc32_like(list(raw[HEADER2_START:HEADER2_CRC_OFFSET])).to_bytes(4, "little")

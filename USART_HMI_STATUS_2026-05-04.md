@@ -1418,3 +1418,54 @@ Until that step is complete, all screen changes remain either:
   - Slider is now promoted to "display + runtime value works" for this seed path.
   - Progress/gauge/QR are "display works, runtime property table/user-record mapping still incomplete".
   - Timer remains excluded from the combined TFT because it is non-visual and does not follow the normal coordinate object body.
+
+## Finding: Extra Visual Controls Runtime Tail Fix 2026-05-11
+
+- 中文结论：
+  - `slider / gauge / progress / qrcode` 单类型新增对象链路已经打通。
+  - 这几个控件不能只补 primary record；还必须同步补：
+    - extra 控件真实 primary record 长度。
+    - 官方 prefix 插入片段。
+    - Header2 中随 prefix 插入增长的加密字段。
+    - 对应布局的完整 mirror record 宽度与中间插槽位置。
+- 已修正的记录长度：
+  - slider `0x01`: primary `0x54`, user slots `40`.
+  - gauge `z`: primary `0x50`, user slots `40`.
+  - progress `j`: primary `0x40`, user slots `33`.
+  - qrcode `:`: primary `0x48`, user slots `33`.
+- 官方复刻结果：
+  - `case_18_gauge` 生成 TFT 与官方 TFT byte-for-byte 一致。
+  - `case_20_progress` 生成 TFT 与官方 TFT byte-for-byte 一致。
+  - `case_21_qrcode` 生成 TFT 只剩尾部极小差异，但真机运行时验证通过。
+  - `case_17_slider` 还有尾部后段差异，但真机运行时验证通过。
+- 真机验证：
+  - Generated progress TFT:
+    - `sendme` returned page `0`.
+    - `get bar1.val` returned `60`.
+    - `bar1.val=85` succeeded.
+    - `get bar1.val` returned `85`.
+    - `get bar1.x` returned `80`.
+  - Generated gauge TFT:
+    - `get gauge1.val` returned `75`.
+    - `gauge1.val=35` succeeded.
+    - `get gauge1.val` returned `35`.
+    - `get gauge1.x` returned `200`.
+  - Generated qrcode TFT:
+    - `get qr1.txt` returned `Hello USART HMI`.
+    - `qr1.txt="HELLO"` succeeded.
+    - `get qr1.txt` returned `HELLO`.
+    - `get qr1.x` returned `350`.
+  - Generated slider TFT:
+    - `get slider1.val` returned `50`.
+    - `slider1.val=80` succeeded.
+    - `get slider1.val` returned `80`.
+    - `get slider1.x` returned `80`.
+- 重要限制：
+  - 多个 advanced extra 控件类型混在同一个 TFT 的官方组合布局还没有样本，不能靠简单合并单控件 prefix/mirror 模板。
+  - 工具现在应拒绝混合 `slider/gauge/progress/qrcode` 多种 advanced layout，直到拿到官方 mixed fixture 后再学习组合规则。
+  - 普通多对象新增仍然可用；安全边界是“普通控件 + 一个 advanced extra 类型”。
+- Evidence files:
+  - `reverse_usarthmi\extra_controls_demo\verify_generated_case20_progress_exact.json`
+  - `reverse_usarthmi\extra_controls_demo\verify_generated_case18_gauge_exact.json`
+  - `reverse_usarthmi\extra_controls_demo\verify_generated_case21_qrcode.json`
+  - `reverse_usarthmi\extra_controls_demo\verify_generated_case17_slider.json`
