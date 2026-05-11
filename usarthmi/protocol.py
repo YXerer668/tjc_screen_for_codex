@@ -139,6 +139,15 @@ def parse_response(data: bytes) -> ParsedResponse:
             details={"message": "Invalid variable, object, or attribute"},
         )
 
+    if code == 0x12:
+        return ParsedResponse(
+            kind="invalid_waveform",
+            raw=data,
+            hex=hex_value,
+            code=code,
+            details={"message": "Invalid waveform object id or channel"},
+        )
+
     if ascii_preview and PRINTABLE_ASCII_RE.match(ascii_preview):
         return ParsedResponse(
             kind="ascii",

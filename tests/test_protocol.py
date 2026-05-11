@@ -66,6 +66,11 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(parsed.kind, "invalid_reference")
         self.assertEqual(parsed.code, 0x1A)
 
+    def test_parse_invalid_waveform_reference(self) -> None:
+        parsed = parse_response(bytes.fromhex("12 FF FF FF"))
+        self.assertEqual(parsed.kind, "invalid_waveform")
+        self.assertEqual(parsed.code, 0x12)
+
 
 if __name__ == "__main__":
     unittest.main()

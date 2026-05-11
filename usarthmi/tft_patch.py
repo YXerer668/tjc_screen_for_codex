@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
+import re
 from typing import Any
 
 from .object_hash import object_name_hash
@@ -19,8 +20,18 @@ TYPE_RECORD_LENGTHS = {
     "t": 0x54,
     "b": 0x54,
     "p": 0x3C,
+    "\x00": 0x5C,  # waveform
+    "4": 0x10,  # variable
+    "5": 0x58,  # dual-state button
+    "6": 0x54,  # number
+    "7": 0x60,  # scrolling text
+    "8": 0x48,  # checkbox
+    "9": 0x40,  # radio
     "\x01": 0x54,  # slider
     "3": 0x24,  # timer
+    "C": 0x50,  # state button
+    "m": 0x3C,  # hotspot/touch area
+    "q": 0x44,  # crop image
     "z": 0x50,  # gauge
     "j": 0x40,  # progress bar
     ":": 0x48,  # QR code
@@ -30,17 +41,44 @@ TYPE_USER_SLOT_COUNTS = {
     "t": 41,
     "b": 42,
     "p": 28,
+    "\x00": 41,
+    "4": 11,
+    "5": 42,
+    "6": 41,
+    "7": 48,
+    "8": 31,
+    "9": 30,
     "\x01": 40,
     "3": 11,
+    "C": 38,
+    "m": 27,
+    "q": 30,
     "z": 40,
     "j": 33,
     ":": 33,
 }
-TEXT_POINTER_RECORD_OFFSETS = {"t": 0x48, "b": 0x4C, ":": 0x44}
+TEXT_POINTER_RECORD_OFFSETS = {
+    "t": 0x48,
+    "b": 0x4C,
+    "5": 0x4C,
+    "7": 0x4C,
+    "C": 0x48,
+    ":": 0x44,
+}
 KNOWN_EXTRA_TYPE_CASES = {
+    "\x00": "case_27_waveform_basic",
+    "4": "case_26_variable_numeric_string",
+    "5": "case_23_dual_state_button",
+    "6": "case_16_number_basic",
+    "7": "case_22_scrolling_text",
+    "8": "case_28_checkbox",
+    "9": "case_29_radio",
     "\x01": "case_17_slider",
     "z": "case_18_gauge",
     "3": "case_19_timer",
+    "C": "case_24_state_button",
+    "m": "case_25_hotspot_touch_area",
+    "q": "case_30_crop_image",
     "j": "case_20_progress",
     ":": "case_21_qrcode",
 }
@@ -53,9 +91,29 @@ IMAGE_BUTTON_PREFIX_INSERT_OFFSET = 0x86
 IMAGE_BUTTON_PREFIX_INSERT = bytes.fromhex("92 48 C9 76")
 PREFIX_DESCRIPTOR_START = 0x3E
 TIMER_TYPE_CODE = "3"
+VARIABLE_TYPE_CODE = "4"
+NON_VISUAL_COORD_TYPES = {TIMER_TYPE_CODE, VARIABLE_TYPE_CODE}
+COMPACT_STRING_LAYOUT_TYPES = {TIMER_TYPE_CODE, "5", "6", "7", "8", "C", "m", "q"}
+MIXED_COMPACT_PRIMARY_TYPES = {"5", "7", "8", "m", "q"}
+MIXED_DESCRIPTOR_LAYOUT_KEY = "__mixed__"
 TYPE_RECORD_HEADER_FLAGS = {
     TIMER_TYPE_CODE: 0x27,
+    VARIABLE_TYPE_CODE: 0x07,
 }
+EVENT_FIELD_USER_SLOTS = {
+    # Recovered from official timer-control TFTs:
+    #   tm0.en=1  -> 01 <slot_start+8> 00 00 00 3d 31
+    #   n0.val++  -> 01 <slot_start+27> 00 00 00 2b 2b
+    TIMER_TYPE_CODE: {
+        "tim": 7,
+        "en": 8,
+    },
+    "6": {
+        "val": 27,
+    },
+}
+EVENT_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(-?\d+)\s*$")
+EVENT_UNARY_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)(\+\+|--)\s*$")
 IMAGE_BUTTON_MIRROR_RELATIVE_VALUES = (
     9,
     10,
@@ -187,6 +245,41 @@ class AddedObjectPatchResult:
 
 
 @dataclass(slots=True)
+class RebuildPagePatchResult:
+    baseline_tft: str
+    seed_pa: str
+    target_pa: str
+    out_tft: str
+    file_size: int
+    object_count: int
+    objects: list[dict[str, Any]]
+    removed_seed_objects: list[str]
+    section_offsets: dict[str, int]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mode": "experimental_clean_page_tft_rebuild",
+            "baseline_tft": self.baseline_tft,
+            "seed_pa": self.seed_pa,
+            "target_pa": self.target_pa,
+            "out_tft": self.out_tft,
+            "file_size": self.file_size,
+            "object_count": self.object_count,
+            "objects": self.objects,
+            "removed_seed_objects": self.removed_seed_objects,
+            "section_offsets": {
+                key: {"value": value, "hex": f"0x{value:X}"}
+                for key, value in self.section_offsets.items()
+            },
+            "warnings": [
+                "Experimental clean rebuild: the baseline TFT is used only as a binary shell and template source.",
+                "The target page object/hash/user/mirror tail is rebuilt from target_pa, so omitted seed objects are not intentionally kept.",
+                "This still depends on recovered templates for each object type; validate with checksum, serial get tests, and camera capture.",
+            ],
+        }
+
+
+@dataclass(slots=True)
 class _UserRecordTemplate:
     slot_index: int
     word1_mode: str
@@ -223,6 +316,12 @@ class _TailSeed:
 class _EventLayout:
     data: bytes
     offsets: list[int]
+    callbacks: list[dict[str, int]]
+
+
+@dataclass(slots=True)
+class _EventCompileContext:
+    field_slot_by_ref: dict[tuple[str, str], int]
 
 
 def patch_basic_tft(
@@ -380,6 +479,67 @@ def patch_added_object_tft(
     )
 
 
+def patch_rebuild_page_tft(
+    baseline_tft: str | Path,
+    *,
+    seed_pa: str | Path,
+    target_pa: str | Path,
+    out_tft: str | Path,
+) -> RebuildPagePatchResult:
+    """Rebuild the compiled page tail from target_pa without keeping seed objects.
+
+    Unlike patch_added_object_tft(), this path does not require the target page
+    to preserve the seed page's existing object list. The seed TFT still
+    provides headers, resources, and per-type binary templates, but the compiled
+    page object/index/user/mirror sections come only from target_pa.
+    """
+
+    baseline_tft_path = Path(baseline_tft).resolve()
+    seed_pa_path = Path(seed_pa).resolve()
+    target_pa_path = Path(target_pa).resolve()
+    out_path = Path(out_tft).resolve()
+
+    seed_page = load_page_file(seed_pa_path)
+    target_page = load_page_file(target_pa_path)
+    _validate_rebuild_page(target_page.blocks)
+
+    seed = _load_tail_seed(baseline_tft_path, seed_pa_path, seed_page)
+    _augment_seed_templates(seed, {block.type_code for block in target_page.blocks})
+    tail, sections = _build_added_object_tail(seed, target_page.blocks)
+    payload = bytearray(seed.raw[: seed.object_start] + tail)
+    image_button_layout = _uses_full_image_button_layout(target_page.blocks)
+
+    _refresh_tft_headers(
+        payload,
+        model=seed.model,
+        model_series=seed.model_series,
+        object_start=seed.object_start,
+        object_count=len(target_page.blocks),
+        attr_relative=sections["attr"],
+        user_relative=sections["user"],
+        picture_relative=sections["pic"],
+        prefix_delta=sections["prefix_delta"],
+        image_button_layout=image_button_layout,
+    )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(payload)
+
+    target_names = {block.objname for block in target_page.blocks if block.objname}
+    seed_names = [block.objname for block in seed_page.blocks if block.objname]
+    return RebuildPagePatchResult(
+        baseline_tft=str(baseline_tft_path),
+        seed_pa=str(seed_pa_path),
+        target_pa=str(target_pa_path),
+        out_tft=str(out_path),
+        file_size=len(payload),
+        object_count=len(target_page.blocks),
+        objects=[_added_block_summary(block) for block in target_page.blocks],
+        removed_seed_objects=[name for name in seed_names if name and name not in target_names],
+        section_offsets=sections,
+    )
+
+
 def _validate_same_layout(base_blocks: list[PageBlock], target_blocks: list[PageBlock]) -> None:
     if len(base_blocks) != len(target_blocks):
         raise TftToolchainError(
@@ -414,6 +574,19 @@ def _validate_added_objects(base_blocks: list[PageBlock], target_blocks: list[Pa
             raise TftToolchainError(f"Unsupported object type in TFT tail generator: {block.type_code!r}")
     _validate_unique_names_and_ids(target_blocks)
     return added_blocks
+
+
+def _validate_rebuild_page(target_blocks: list[PageBlock]) -> None:
+    if not target_blocks:
+        raise TftToolchainError("Clean page rebuild requires at least a page block")
+    if target_blocks[0].type_code != "y":
+        raise TftToolchainError(
+            f"Clean page rebuild expects the first block to be page type 'y', got {target_blocks[0].type_code!r}"
+        )
+    for block in target_blocks:
+        if block.type_code not in TYPE_RECORD_LENGTHS:
+            raise TftToolchainError(f"Unsupported object type in TFT page rebuild: {block.type_code!r}")
+    _validate_unique_names_and_ids(target_blocks)
 
 
 def _validate_unique_names_and_ids(blocks: list[PageBlock]) -> None:
@@ -500,7 +673,10 @@ def _augment_seed_templates(seed: _TailSeed, needed_types: set[str]) -> None:
                 for key, value in case_seed.mirror_templates.items()
             }
             seed.mirror_descriptor_sequences[type_code] = _prefix_descriptor_sequence(case_seed.compiled_prefix)
-            seed.prefix_inserts[type_code] = _derive_prefix_insertions_for_case(seed, case_seed, case_page)
+            if type_code == VARIABLE_TYPE_CODE:
+                seed.prefix_inserts[type_code] = []
+            else:
+                seed.prefix_inserts[type_code] = _derive_prefix_insertions_for_case(seed, case_seed, case_page)
         else:
             unresolved.append(type_code)
 
@@ -609,16 +785,20 @@ def _load_tail_seed(
             if record == b"\x00" * 24:
                 continue
             words = [int.from_bytes(record[index : index + 4], "little") for index in range(0, 24, 4)]
-            word1_mode = (
-                "text_pointer"
-                if words[5] == 0x0B3F or (type_code == ":" and words[5] == 0x1F3F)
-                else "value_delta"
-            )
+            if words[5] in {0x0B3F, 0x193F} or (type_code == ":" and words[5] == 0x1F3F):
+                word1_mode = "text_pointer"
+                word1_delta = words[1] - value_base
+            elif type_code == "m" and words[1] < value_base:
+                word1_mode = "absolute"
+                word1_delta = words[1]
+            else:
+                word1_mode = "value_delta"
+                word1_delta = words[1] - value_base
             entries.append(
                 _UserRecordTemplate(
                     slot_index=slot_index,
                     word1_mode=word1_mode,
-                    word1_delta=words[1] - value_base,
+                    word1_delta=word1_delta,
                     word2=words[2],
                     word3=words[3],
                     word4=words[4],
@@ -730,6 +910,8 @@ def _build_added_object_tail(
 ) -> tuple[bytes, dict[str, int]]:
     object_count = len(target_blocks)
     image_button_layout = _uses_full_image_button_layout(target_blocks)
+    if _uses_mixed_compact_primary_layout(seed, target_blocks):
+        _augment_official_mixed_layout(seed)
     mirror_layout_type = _mirror_layout_type_for_blocks(seed, target_blocks)
     prefix_head = _prefix_head_for_layout(
         seed.prefix_head,
@@ -760,10 +942,15 @@ def _build_added_object_tail(
     primary_data, value_offsets, text_pointer_by_id, primary_pre_string_len = _build_primary_block(
         seed,
         target_blocks,
+        event_callbacks=event_layout.callbacks,
     )
     out.extend(_code_block(primary_data))
-    if any(block.type_code in {"\x01", TIMER_TYPE_CODE} for block in target_blocks):
+    if any(block.type_code in {"\x00", "\x01", "7", TIMER_TYPE_CODE} for block in target_blocks):
         out.extend(_code_block(bytes.fromhex("09 1f 04 34")))
+    if _uses_mixed_compact_primary_layout(seed, target_blocks) and any(
+        block.type_code == "\x00" for block in target_blocks
+    ):
+        out.extend(_code_block(bytes.fromhex("09 1f 04 37")))
     out.extend(_code_block(b"\x09\x30\x08"))
     out.extend(_code_block(b""))
 
@@ -799,13 +986,18 @@ def _build_added_object_tail(
             user_offset=user_offset,
             primary_pre_string_len=primary_pre_string_len,
             event_offsets=event_layout.offsets,
+            event_callbacks=event_layout.callbacks,
             image_button_layout=image_button_layout,
         )
     )
     padding_offset = len(out)
     padding_size = (-len(out)) % 4
     if padding_size:
-        padding_byte = b"\xFF" if image_button_layout or any(block.type_code == TIMER_TYPE_CODE for block in target_blocks) else b"\x00"
+        padding_byte = (
+            b"\xFF"
+            if image_button_layout or any(block.type_code in {"\x00", "9", "C", "q", TIMER_TYPE_CODE} for block in target_blocks)
+            else b"\x00"
+        )
         out.extend(padding_byte * padding_size)
     out.extend(b"\x00\x00\x00\x00")
     return bytes(out), {
@@ -828,62 +1020,126 @@ def _build_event_layout(
 ) -> _EventLayout:
     data = bytearray()
     offsets: list[int] = []
+    callbacks: list[dict[str, int]] = []
+    context = _build_event_compile_context(target_blocks)
     for index, block in enumerate(target_blocks):
-        offsets.append(base_offset + len(data))
+        block_offset = base_offset + len(data)
+        offsets.append(block_offset)
         if index == 0:
-            event_data = _build_page_event_table(block)
+            event_data = _build_page_event_table(block, context=context)
             event_data = _page_event_for_layout(event_data, image_button_layout=image_button_layout)
+            callbacks.append({})
         else:
-            event_data = _build_object_event_table(block)
+            event_data = _build_object_event_table(block, context=context)
+            callbacks.append(_object_event_callback_offsets(block, block_offset, context=context))
         data.extend(event_data)
-    return _EventLayout(data=bytes(data), offsets=offsets)
+    return _EventLayout(data=bytes(data), offsets=offsets, callbacks=callbacks)
 
 
-def _build_page_event_table(block: PageBlock) -> bytes:
+def _build_page_event_table(block: PageBlock, *, context: _EventCompileContext | None = None) -> bytes:
     events = _events_by_prefix(block)
     load_lines = events.get("codesload-", [])
     loadend_lines = events.get("codesloadend-", [])
-    load_phase = _compile_event_script(load_lines)
+    load_phase = _compile_event_script(load_lines, context=context)
     if load_lines or loadend_lines:
         # Official TFTs separate pre-load and post-load page events with this
         # sentinel item. Empty pages omit it, which keeps seed reproduction exact.
-        load_phase = load_phase[:-4] + _event_item(b"\x09\x30\x08") + _compile_event_script(loadend_lines)
+        load_phase = load_phase[:-4] + _event_item(b"\x09\x30\x08") + _compile_event_script(loadend_lines, context=context)
     return b"".join(
         [
             load_phase,
             _event_item(b"down"),
-            _compile_event_script(events.get("codesdown-", [])),
+            _compile_event_script(events.get("codesdown-", []), context=context),
             _event_item(b"up"),
-            _compile_event_script(events.get("codesup-", [])),
+            _compile_event_script(events.get("codesup-", []), context=context),
             _event_item(b"unload"),
-            _compile_event_script(events.get("codesunload-", [])),
+            _compile_event_script(events.get("codesunload-", []), context=context),
         ]
     )
 
 
-def _build_object_event_table(block: PageBlock) -> bytes:
+def _build_object_event_table(block: PageBlock, *, context: _EventCompileContext | None = None) -> bytes:
     events = _events_by_prefix(block)
+    if block.type_code == VARIABLE_TYPE_CODE and not events:
+        return _compile_event_script([], context=context)
     parts = [
-        _compile_event_script([]),
+        _compile_event_script([], context=context),
         _event_item(b"down"),
-        _compile_event_script(events.get("codesdown-", [])),
+        _compile_event_script(events.get("codesdown-", []), context=context),
         _event_item(b"up"),
-        _compile_event_script(events.get("codesup-", [])),
+        _compile_event_script(events.get("codesup-", []), context=context),
     ]
     if block.type_code == "\x01":
         parts.extend(
             [
                 _event_item(b"slide"),
-                _compile_event_script(events.get("codesslide-", [])),
+                _compile_event_script(events.get("codesslide-", []), context=context),
             ]
         )
     elif block.type_code == TIMER_TYPE_CODE:
         parts = [
-            _compile_event_script([]),
+            _compile_event_script([], context=context),
             _event_item(b"timer"),
-            _compile_event_script(events.get("codestimer-", [])),
+            _compile_event_script(events.get("codestimer-", []), context=context),
         ]
     return b"".join(parts)
+
+
+def _object_event_callback_offsets(
+    block: PageBlock,
+    block_offset: int,
+    *,
+    context: _EventCompileContext | None,
+) -> dict[str, int]:
+    """Return direct event-code entry pointers used by the runtime scheduler.
+
+    The mirror record still stores the full event table offset, but official
+    TFTs also cache the first executable item for each non-empty event. Without
+    these pointers, the event table is present but click/timer callbacks never
+    run on device.
+    """
+
+    events = _events_by_prefix(block)
+    callbacks: dict[str, int] = {}
+    cursor = block_offset
+
+    cursor += len(_compile_event_script([], context=context))
+    if block.type_code == TIMER_TYPE_CODE:
+        cursor += len(_event_item(b"timer"))
+        if _event_script_has_payload(events.get("codestimer-", []), context=context):
+            callbacks["codestimer-"] = cursor
+        return callbacks
+
+    cursor += len(_event_item(b"down"))
+    down_lines = events.get("codesdown-", [])
+    if _event_script_has_payload(down_lines, context=context):
+        callbacks["codesdown-"] = cursor
+    cursor += len(_compile_event_script(down_lines, context=context))
+
+    cursor += len(_event_item(b"up"))
+    up_lines = events.get("codesup-", [])
+    if _event_script_has_payload(up_lines, context=context):
+        callbacks["codesup-"] = cursor
+    return callbacks
+
+
+def _event_script_has_payload(lines: list[str], *, context: _EventCompileContext | None) -> bool:
+    for line in lines:
+        if _compile_event_line(line, context=context) is not None:
+            return True
+    return False
+
+
+def _build_event_compile_context(target_blocks: list[PageBlock]) -> _EventCompileContext:
+    field_slot_by_ref: dict[tuple[str, str], int] = {}
+    slot_start = 0
+    for block in target_blocks:
+        name = block.objname
+        if name:
+            for field_name, relative_slot in EVENT_FIELD_USER_SLOTS.get(block.type_code, {}).items():
+                field_slot_by_ref[(name, field_name)] = slot_start + relative_slot
+        slot_start += _user_slot_count(block)
+    return _EventCompileContext(field_slot_by_ref=field_slot_by_ref)
 
 
 def _events_by_prefix(block: PageBlock) -> dict[str, list[str]]:
@@ -906,10 +1162,10 @@ def _events_by_prefix(block: PageBlock) -> dict[str, list[str]]:
     return events
 
 
-def _compile_event_script(lines: list[str]) -> bytes:
+def _compile_event_script(lines: list[str], *, context: _EventCompileContext | None = None) -> bytes:
     out = bytearray()
     for line in lines:
-        payload = _compile_event_line(line)
+        payload = _compile_event_line(line, context=context)
         if payload is None:
             continue
         out.extend(_event_item(payload))
@@ -917,10 +1173,14 @@ def _compile_event_script(lines: list[str]) -> bytes:
     return bytes(out)
 
 
-def _compile_event_line(line: str) -> bytes | None:
+def _compile_event_line(line: str, *, context: _EventCompileContext | None = None) -> bytes | None:
     stripped = line.strip()
     if not stripped or stripped.startswith("//"):
         return None
+
+    compiled_property_event = _compile_property_event(stripped, context=context)
+    if compiled_property_event is not None:
+        return compiled_property_event
 
     lower = stripped.lower()
     if lower.startswith("page "):
@@ -958,8 +1218,43 @@ def _compile_event_line(line: str) -> bytes | None:
 
     raise TftToolchainError(
         "Unsupported event line for the current minimal logic compiler: "
-        f"{line!r}. Supported V1 event commands are page/printh/click/vis/rawhex."
+        f"{line!r}. Supported V1 event commands are page/printh/click/vis/rawhex "
+        "and numeric object-field assignment/inc/dec such as tm0.en=1."
     )
+
+
+def _compile_property_event(line: str, *, context: _EventCompileContext | None) -> bytes | None:
+    assign = EVENT_ASSIGN_RE.match(line)
+    if assign is not None:
+        object_name, field_name, value = assign.groups()
+        slot = _event_field_slot(object_name, field_name, context=context, source=line)
+        return b"\x01" + slot.to_bytes(4, "little") + b"=" + value.encode("ascii")
+
+    unary = EVENT_UNARY_RE.match(line)
+    if unary is not None:
+        object_name, field_name, operator = unary.groups()
+        slot = _event_field_slot(object_name, field_name, context=context, source=line)
+        return b"\x01" + slot.to_bytes(4, "little") + operator.encode("ascii")
+
+    return None
+
+
+def _event_field_slot(
+    object_name: str,
+    field_name: str,
+    *,
+    context: _EventCompileContext | None,
+    source: str,
+) -> int:
+    if context is None:
+        raise TftToolchainError(f"Event line {source!r} requires a compiled object context")
+    slot = context.field_slot_by_ref.get((object_name, field_name))
+    if slot is None:
+        raise TftToolchainError(
+            f"Unsupported event field reference {object_name}.{field_name!s} in {source!r}. "
+            "Only recovered numeric fields can be compiled currently."
+        )
+    return slot
 
 
 def _event_item(payload: bytes) -> bytes:
@@ -969,23 +1264,29 @@ def _event_item(payload: bytes) -> bytes:
 def _build_primary_block(
     seed: _TailSeed,
     target_blocks: list[PageBlock],
+    *,
+    event_callbacks: list[dict[str, int]],
 ) -> tuple[bytes, list[int], dict[int, int], int]:
     object_count = len(target_blocks)
+    mixed_compact_primary = _uses_mixed_compact_primary_layout(seed, target_blocks)
     first_value = 0x10 + object_count * 4
     value_offsets: list[int] = []
     cursor = first_value
     for block in target_blocks:
         value_offsets.append(cursor)
-        cursor += TYPE_RECORD_LENGTHS[block.type_code]
+        cursor += _primary_record_length(block.type_code, mixed_compact=mixed_compact_primary)
 
-    primary_pre_string_len = object_count * 4 + sum(TYPE_RECORD_LENGTHS[block.type_code] for block in target_blocks)
+    primary_pre_string_len = object_count * 4 + sum(
+        _primary_record_length(block.type_code, mixed_compact=mixed_compact_primary)
+        for block in target_blocks
+    )
     data = bytearray(b"".join(value.to_bytes(4, "little") for value in value_offsets))
     text_slots: list[tuple[str, int]] = []
     text_pointer_by_id: dict[int, int] = {}
     string_cursor = 0
-    timer_tail_layout = bool(target_blocks and target_blocks[-1].type_code == TIMER_TYPE_CODE)
-    string_pointer_bias = 0x10 if timer_tail_layout else 0x14
-    for block, value_base in zip(target_blocks, value_offsets):
+    compact_tail_layout = any(block.type_code in COMPACT_STRING_LAYOUT_TYPES for block in target_blocks)
+    string_pointer_bias = 0x10 if compact_tail_layout else 0x14
+    for index, (block, value_base) in enumerate(zip(target_blocks, value_offsets)):
         type_code = block.type_code
         record = bytearray(seed.primary_templates[type_code])
         object_id = _required_field_int(block, "id")
@@ -993,8 +1294,11 @@ def _build_primary_block(
         record[1] = object_id
         record[2] = 0
         record[3] = _record_header_flag(type_code)
+        _apply_event_callback_fields(record, event_callbacks[index])
         if type_code == TIMER_TYPE_CODE:
             _patch_timer_record(record, block)
+        elif type_code == VARIABLE_TYPE_CODE:
+            pass
         else:
             record[0x1C:0x20] = value_base.to_bytes(4, "little")
             record[0x28:0x34] = _coord_payload(block)
@@ -1002,6 +1306,8 @@ def _build_primary_block(
             _patch_text_record(record, block)
         elif type_code == "b":
             _patch_button_record(record, block)
+        elif type_code == "6":
+            _patch_number_record(record, block)
         if type_code in TEXT_POINTER_RECORD_OFFSETS:
             text = _field_text(block, "txt") or ""
             slot_len = _text_slot_len(block)
@@ -1014,18 +1320,64 @@ def _build_primary_block(
         elif type_code == "p":
             picture_id = _field_int(block, "pic") or 0
             record[0x38:0x3A] = picture_id.to_bytes(2, "little")
-        data.extend(record)
+        data.extend(record[: _primary_record_length(type_code, mixed_compact=mixed_compact_primary)])
 
-    if not timer_tail_layout:
+    if not compact_tail_layout:
         data.extend(b"\x00\x00\x00\x00")
     for text, slot_len in text_slots:
         encoded = _encode_display_text(text)
         if len(encoded) > slot_len:
             raise TftToolchainError(f"Text {text!r} exceeds compiled text slot length {slot_len}")
         data.extend(encoded.ljust(slot_len, b"\x00"))
-    data.extend(b"\x00\x00\x00\x00")
-    mirror_pre_string_len = primary_pre_string_len - 4 if timer_tail_layout else primary_pre_string_len
+    data.extend(_primary_final_marker(target_blocks, value_offsets))
+    _patch_waveform_primary_runtime_anchors(
+        data,
+        target_blocks,
+        value_offsets,
+        mixed_compact_primary=mixed_compact_primary,
+    )
+    mirror_pre_string_len = primary_pre_string_len - 4 if compact_tail_layout else primary_pre_string_len
     return bytes(data), value_offsets, text_pointer_by_id, mirror_pre_string_len
+
+
+def _primary_final_marker(target_blocks: list[PageBlock], value_offsets: list[int]) -> bytes:
+    for block in target_blocks:
+        if block.type_code == "\x00":
+            # Official append and mixed fixtures keep this marker stable even
+            # when the waveform object's value record moves later in the page.
+            return (0x114).to_bytes(4, "little")
+    return b"\x00\x00\x00\x00"
+
+
+def _patch_waveform_primary_runtime_anchors(
+    data: bytearray,
+    target_blocks: list[PageBlock],
+    value_offsets: list[int],
+    *,
+    mixed_compact_primary: bool,
+) -> None:
+    primary_size = len(data)
+    for block, value_offset in zip(target_blocks, value_offsets):
+        if block.type_code != "\x00":
+            continue
+        record_length = _primary_record_length(block.type_code, mixed_compact=mixed_compact_primary)
+        record_start = value_offset - 0x10
+        anchor_offset = record_start + record_length - 4
+        data[anchor_offset : anchor_offset + 4] = (primary_size + 0x0C).to_bytes(4, "little")
+
+
+def _primary_record_length(type_code: str, *, mixed_compact: bool) -> int:
+    length = TYPE_RECORD_LENGTHS[type_code]
+    if mixed_compact and type_code in MIXED_COMPACT_PRIMARY_TYPES:
+        return length - 4
+    return length
+
+
+def _apply_event_callback_fields(record: bytearray, callbacks: dict[str, int]) -> None:
+    for event_name, callback_offset in callbacks.items():
+        field_offset = _mirror_event_callback_field_offset(event_name)
+        if field_offset is not None:
+            record[field_offset : field_offset + 4] = callback_offset.to_bytes(4, "little")
 
 
 def _patch_text_record(record: bytearray, block: PageBlock) -> None:
@@ -1087,6 +1439,37 @@ def _patch_button_record(record: bytearray, block: PageBlock) -> None:
     _write_record_u16_from_field(record, 0x4A, block, "txt_maxl")
 
 
+def _patch_number_record(record: bytearray, block: PageBlock) -> None:
+    sta = _field_int(block, "sta")
+    if sta is not None:
+        record[0x38] = sta & 0xFF
+    style = _field_int(block, "style")
+    if style is not None:
+        record[0x39] = style & 0xFF
+
+    _write_record_u16_from_field(record, 0x3A, block, "borderc")
+    _write_record_u8_from_field(record, 0x3D, block, "font")
+
+    if sta == 2:
+        _write_record_u16_from_field(record, 0x3E, block, "pic")
+    elif sta == 0:
+        _write_record_u16_from_field(record, 0x3E, block, "picc")
+    else:
+        _write_record_u16_from_field(record, 0x3E, block, "bco")
+
+    _write_record_u16_from_field(record, 0x40, block, "pco")
+    _write_record_u8_from_field(record, 0x42, block, "xcen")
+    _write_record_u8_from_field(record, 0x43, block, "ycen")
+    value = _field_int(block, "val")
+    if value is not None:
+        record[0x44:0x48] = (value & 0xFFFFFFFF).to_bytes(4, "little")
+    _write_record_u16_from_field(record, 0x48, block, "lenth")
+    _write_record_u16_from_field(record, 0x4A, block, "format")
+    _write_record_u16_from_field(record, 0x4C, block, "isbr")
+    _write_record_u16_from_field(record, 0x4E, block, "spax")
+    _write_record_u16_from_field(record, 0x50, block, "spay")
+
+
 def _patch_timer_record(record: bytearray, block: PageBlock) -> None:
     tim = _field_int(block, "tim")
     if tim is not None:
@@ -1137,6 +1520,8 @@ def _build_user_records(
                 continue
             if template.word1_mode == "text_pointer":
                 word1 = text_pointer_by_id[object_id]
+            elif template.word1_mode == "absolute":
+                word1 = template.word1_delta
             else:
                 word1 = value_base + template.word1_delta
             word2 = _user_record_word2(template, block, max_picture_id=max_picture_id)
@@ -1145,12 +1530,18 @@ def _build_user_records(
                 word1,
                 word2,
                 template.word3,
-                (template.word4 & 0xFFFF00FF) | (object_id << 8),
+                _user_record_word4(template, block, object_id),
                 template.word5,
             ]
             slots[template.slot_index] = b"".join(word.to_bytes(4, "little") for word in words)
         out.extend(b"".join(slots))
     return bytes(out)
+
+
+def _user_record_word4(template: _UserRecordTemplate, block: PageBlock, object_id: int) -> int:
+    if block.type_code == VARIABLE_TYPE_CODE:
+        return template.word4
+    return (template.word4 & 0xFFFF00FF) | (object_id << 8)
 
 
 def _user_record_word2(
@@ -1183,10 +1574,96 @@ def _uses_full_image_button_layout(blocks: list[PageBlock]) -> bool:
 
 
 def _prefix_insertions_for_blocks(seed: _TailSeed, blocks: list[PageBlock]) -> list[tuple[int, bytes]]:
+    type_insertions = [
+        seed.prefix_inserts[type_code]
+        for type_code in sorted({block.type_code for block in blocks})
+        if seed.prefix_inserts.get(type_code)
+    ]
+    if len(type_insertions) <= 1:
+        return [item for insertions in type_insertions for item in insertions]
+
+    descriptor_insertions = _mixed_descriptor_insertions_for_blocks(seed, blocks)
+    if descriptor_insertions is not None:
+        return descriptor_insertions
+
     insertions: list[tuple[int, bytes]] = []
-    for type_code in sorted({block.type_code for block in blocks}):
-        insertions.extend(seed.prefix_inserts.get(type_code, []))
+    for items in type_insertions:
+        insertions.extend(_descriptor_insertions(items))
     return insertions
+
+
+def _mixed_descriptor_insertions_for_blocks(
+    seed: _TailSeed,
+    blocks: list[PageBlock],
+) -> list[tuple[int, bytes]] | None:
+    desired: set[bytes] = set(seed.mirror_descriptor_sequences[""])
+    for type_code in {block.type_code for block in blocks}:
+        desired.update(seed.mirror_descriptor_sequences.get(type_code, []))
+
+    _augment_official_mixed_layout(seed)
+    canonical_order = seed.mirror_descriptor_sequences.get(MIXED_DESCRIPTOR_LAYOUT_KEY)
+    if canonical_order is None or not desired.issubset(set(canonical_order)):
+        return None
+
+    desired_sequence = [descriptor for descriptor in canonical_order if descriptor in desired]
+    return _descriptor_insertions_from_sequence(seed.mirror_descriptor_sequences[""], desired_sequence)
+
+
+def _augment_official_mixed_layout(seed: _TailSeed) -> None:
+    if MIXED_DESCRIPTOR_LAYOUT_KEY in seed.mirror_descriptor_sequences:
+        return
+    case_root = Path(DEFAULT_CASE_ROOT)
+    case_dir = case_root / "case_33_all_controls_mixed_stress"
+    case_tft = case_dir / "lcd_test.tft"
+    case_hmi = case_dir / "lcd_test.HMI"
+    if not case_tft.exists() or not case_hmi.exists():
+        return
+    try:
+        case_page = _load_hmi_page0(case_hmi)
+        case_seed = _load_tail_seed(case_tft, case_hmi, case_page)
+    except TftToolchainError:
+        return
+    seed.mirror_descriptor_sequences[MIXED_DESCRIPTOR_LAYOUT_KEY] = _prefix_descriptor_sequence(
+        case_seed.compiled_prefix
+    )
+    seed.mirror_layout_templates[MIXED_DESCRIPTOR_LAYOUT_KEY] = {
+        type_code: list(values)
+        for type_code, values in case_seed.mirror_templates.items()
+    }
+
+
+def _descriptor_insertions_from_sequence(
+    base_sequence: list[bytes],
+    desired_sequence: list[bytes],
+) -> list[tuple[int, bytes]]:
+    insertions: list[tuple[int, bytes]] = []
+    base_index = 0
+    for descriptor in desired_sequence:
+        if base_index < len(base_sequence) and descriptor == base_sequence[base_index]:
+            base_index += 1
+            continue
+        insertions.append((PREFIX_DESCRIPTOR_START + base_index * 4, descriptor))
+    return insertions
+
+
+def _uses_mixed_compact_primary_layout(seed: _TailSeed, blocks: list[PageBlock]) -> bool:
+    contributing_types = [
+        type_code
+        for type_code in {block.type_code for block in blocks}
+        if seed.prefix_inserts.get(type_code)
+    ]
+    return len(contributing_types) > 1
+
+
+def _descriptor_insertions(insertions: list[tuple[int, bytes]]) -> list[tuple[int, bytes]]:
+    expanded: list[tuple[int, bytes]] = []
+    for offset, payload in insertions:
+        if len(payload) % 4:
+            expanded.append((offset, payload))
+            continue
+        for cursor in range(0, len(payload), 4):
+            expanded.append((offset + cursor, payload[cursor : cursor + 4]))
+    return expanded
 
 
 def _derive_prefix_insertions_for_case(
@@ -1229,6 +1706,12 @@ def _derive_prefix_insertions_for_case(
 
 
 def _mirror_layout_type_for_blocks(seed: _TailSeed, blocks: list[PageBlock]) -> str | None:
+    if (
+        _uses_mixed_compact_primary_layout(seed, blocks)
+        and MIXED_DESCRIPTOR_LAYOUT_KEY in seed.mirror_layout_templates
+        and all(block.type_code in seed.mirror_layout_templates[MIXED_DESCRIPTOR_LAYOUT_KEY] for block in blocks)
+    ):
+        return MIXED_DESCRIPTOR_LAYOUT_KEY
     candidates = [
         block.type_code
         for block in blocks
@@ -1292,13 +1775,29 @@ def _prefix_head_for_layout(
 
 
 def _prefix_inserted_bytes_before(insertions: list[tuple[int, bytes]], offset: int) -> int:
-    return sum(len(payload) for item_offset, payload in set(insertions) if item_offset < offset)
+    seen: set[tuple[int, bytes]] = set()
+    total = 0
+    for item_offset, payload in insertions:
+        item = (item_offset, payload)
+        if item in seen:
+            continue
+        seen.add(item)
+        if item_offset < offset:
+            total += len(payload)
+    return total
 
 
 def _apply_prefix_insertions(prefix: bytes, insertions: list[tuple[int, bytes]]) -> bytes:
     if not insertions:
         return prefix
-    deduped = sorted(set(insertions), key=lambda item: (item[0], item[1]))
+    deduped: list[tuple[int, bytes]] = []
+    seen: set[tuple[int, bytes]] = set()
+    for item in insertions:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    deduped.sort(key=lambda item: item[0])
     patched = bytearray(prefix)
     shift = 0
     for offset, payload in deduped:
@@ -1364,6 +1863,7 @@ def _build_mirror_records(
     user_offset: int,
     primary_pre_string_len: int,
     event_offsets: list[int],
+    event_callbacks: list[dict[str, int]],
     image_button_layout: bool,
 ) -> bytes:
     out = bytearray()
@@ -1377,6 +1877,10 @@ def _build_mirror_records(
         type_code = block.type_code
         object_id = _required_field_int(block, "id")
         record = bytearray(bytes([ord(type_code), object_id, 0, _record_header_flag(type_code)]) + b"\xFF" * 24)
+        for event_name, callback_offset in event_callbacks[index].items():
+            field_offset = _mirror_event_callback_field_offset(event_name)
+            if field_offset is not None:
+                record[field_offset : field_offset + 4] = callback_offset.to_bytes(4, "little")
         record.extend(value_base.to_bytes(4, "little"))
         record.extend(b"\x00\x00\x7F\x00")
         record.extend(b"\x00\x00\x00\x00")
@@ -1405,6 +1909,16 @@ def _build_mirror_records(
         out.extend(record)
         slot_start += _user_slot_count(block)
     return bytes(out)
+
+
+def _mirror_event_callback_field_offset(event_name: str) -> int | None:
+    if event_name == "codesdown-":
+        return 0x0C
+    if event_name == "codesup-":
+        return 0x10
+    if event_name == "codestimer-":
+        return 0x14
+    return None
 
 
 def _mirror_values_for_block(
@@ -1605,7 +2119,7 @@ def _coord_payload(block: PageBlock) -> bytes:
 
 
 def _mirror_coord_payload(block: PageBlock) -> bytes:
-    if block.type_code == TIMER_TYPE_CODE:
+    if block.type_code in NON_VISUAL_COORD_TYPES:
         return bytes.fromhex("00 00 00 00 01 00 01 00 00 00 00 00")
     return _coord_payload(block)
 
@@ -1645,6 +2159,8 @@ def _compiled_text_offset(block_reverse: dict[str, Any] | None) -> int | None:
 def _text_slot_len(block: PageBlock) -> int:
     txt_maxl = _field_int(block, "txt_maxl")
     if txt_maxl is not None:
+        if block.type_code == "C":
+            return txt_maxl + 4
         return txt_maxl + 2
     text = _field_text(block, "txt")
     return max(len(_encode_display_text(text)) if text else 0, 1)

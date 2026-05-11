@@ -1553,3 +1553,301 @@ Until that step is complete, all screen changes remain either:
 - Regression tests:
   - `python -m pytest tests\test_tft_patch.py tests\test_scene_layout.py tests\test_editor_tft_build.py -q`
   - Result after CLI timer fix: `40 passed, 22 subtests passed`
+
+## Finding: Event Callback Runtime Pointers And Number Control 2026-05-11
+
+- Event callback fix:
+  - Object event bytecode alone is not enough; official TFTs cache executable callback entry offsets in both primary and mirror object records.
+  - Recovered fields:
+    - `codesdown-` callback pointer at record offset `0x0C`.
+    - `codesup-` callback pointer at record offset `0x10`.
+    - `codestimer-` callback pointer at record offset `0x14`.
+  - After writing these pointers in both record copies, real screen event dispatch works.
+- Live event validation on `COM36`:
+  - `case19_printh_patch`: `click b0 down` returned raw `23 02 42 44`, proving button down event dispatch.
+  - `assign_opcode_probe`: `click startbtn down` returned `23 02 41 31 23 02 41 32 23 02 41 33 ...`, changed `t0.x` from `832` to `120`, changed `tm0.en` from `0` to `1`, and started timer prints `23 02 54 30`.
+  - Earlier apparent `tm0.en=1` failure was caused by the timer event immediately running `tm0.en=0`, not by a broken assignment opcode.
+- Number control support:
+  - Official ordinary number control uses HMI/TFT type code `6`.
+  - Primary record length: `0x54`.
+  - User slot count: `41`.
+  - Mirror layout for the number fixture uses the combined descriptor width `43`.
+  - Type `6` shares the compact primary tail/string layout previously seen on timer; it omits the normal 4-byte pre-string sentinel and uses string pointer bias `0x10`.
+  - `editor.build_scene` now uses the local official `case_16_number_basic` prototype for scene `number` widgets instead of the keyboard page's incompatible `type 4` object.
+- Live number validation on `COM36`:
+  - Built and uploaded `reverse_usarthmi\live_number_demo\output.tft`.
+  - Initial `get numval.val -> 123`.
+  - `click incbtn down` returned raw `23 02 4e 31`.
+  - After the click, `get numval.val -> 124`, proving `numval.val++` event compilation and runtime mutation.
+- Artifacts:
+  - `examples\number_demo\scene.json`
+  - `reverse_usarthmi\live_number_demo\output.hmi`
+  - `reverse_usarthmi\live_number_demo\output.tft`
+  - `reverse_usarthmi\live_number_demo\manifest.json`
+  - `reverse_usarthmi\event_logic_probe\assign_opcode_probe\scene.json`
+  - `reverse_usarthmi\event_logic_probe\assign_low_slot\scene.json`
+- Regression tests:
+  - `python -m pytest tests\test_tft_patch.py tests\test_editor_tft_build.py -q`
+  - Result: `28 passed, 23 subtests passed`
+
+## Milestone: Official GUI Compile Capture Automation 2026-05-11
+
+- Added an official comparison generator:
+  - `tools\official_hmi_compile_capture.py`
+  - It launches `USART HMI.exe`, opens a target `.HMI`, clicks the official `编译` toolbar button, waits for `%APPDATA%\USART HMI\work\a-*\run.run`, and copies the newest official output into a chosen fixture directory.
+- Smoke verification:
+  - Input: `reverse_usarthmi\official_timer_samples\timer_control.HMI`.
+  - Captured output: `reverse_usarthmi\official_timer_samples\official_compile_capture\timer_control.run`.
+  - The captured file is byte-for-byte identical to `reverse_usarthmi\official_timer_samples\official_compile_output\timer_control.run`.
+  - Official log included `编译成功! 0个错误, 0个警告`.
+- Batch official captures generated:
+  - `reverse_usarthmi\official_case_runs\case_17_slider\lcd_test.run`, size `11,016,304`.
+  - `reverse_usarthmi\official_case_runs\case_18_gauge\lcd_test.run`, size `11,016,236`.
+  - `reverse_usarthmi\official_case_runs\case_19_timer\lcd_test.run`, size `11,015,436`.
+  - `reverse_usarthmi\official_case_runs\case_20_progress\lcd_test.run`, size `11,015,996`.
+  - `reverse_usarthmi\official_case_runs\case_21_qrcode\lcd_test.run`, size `11,016,024`.
+- Why this matters:
+  - We now have a reproducible path to create official byte-level fixtures from the user's desktop case folders without manual mouse/screenshot work.
+  - This unblocks faster reverse loops for slider, gauge, timer, progress, QR code, and future official comparison cases.
+
+## Finding: New Control Fixtures 22-34 And TFT Type Table 2026-05-11
+
+- User-provided official samples were added under `C:\Users\SinYu\Desktop\case_for_codex`:
+  - `case_22_scrolling_text`
+  - `case_23_dual_state_button`
+  - `case_24_state_button`
+  - `case_25_hotspot_touch_area`
+  - `case_26_variable_numeric_string`
+  - `case_27_waveform_basic`
+  - `case_28_checkbox`
+  - `case_29_radio`
+  - `case_30_crop_image`
+  - `case_31_multi_page_navigation`
+  - `case_32_timer_autorun_witness`
+  - `case_33_all_controls_mixed_stress`
+  - `case_34_complex_event_logic`
+- Extracted single-page samples were written into `reverse_usarthmi\case_compare\case_22_*` through `case_34_*`.
+- New recovered TFT object type table entries:
+  - waveform: type `0x00`, primary record `0x5C`, user slots `41`.
+  - variable: type `4`, primary record `0x10`, user slots `11`, non-visual, header flag `0x07`.
+  - dual-state button: type `5`, primary record `0x58`, user slots `42`.
+  - scrolling text: type `7`, primary record `0x60`, user slots `48`.
+  - checkbox: type `8`, primary record `0x48`, user slots `31`.
+  - radio: type `9`, primary record `0x40`, user slots `30`.
+  - state button: type `C`, primary record `0x50`, user slots `38`.
+  - hotspot/touch area: type `m`, primary record `0x3C`, user slots `27`.
+  - crop image: type `q`, primary record `0x44`, user slots `30`.
+- Tooling changes:
+  - `tft_patch.TYPE_RECORD_LENGTHS`, `TYPE_USER_SLOT_COUNTS`, and `KNOWN_EXTRA_TYPE_CASES` now include the new types above.
+  - Variable objects are treated as non-visual records and do not require normal `x/y/w/h/endx/endy` coordinates.
+  - `5/7/C` text-bearing controls use the compact string layout seen in official fixtures, without the normal pre-string sentinel.
+- Verification:
+  - `case_23_dual_state_button` now reproduces the official TFT byte-for-byte from the baseline TFT plus target `0.pa`.
+  - `case_22` through `case_30` all compile through `patch_added_object_tft` into checksum-valid TFTs.
+  - `case_32_timer_autorun_witness` and `case_34_complex_event_logic` also compile into checksum-valid TFTs during manual verification.
+- Current limits:
+  - Most new controls are at "valid generated TFT" level, not yet "byte-perfect and live-smoked" level.
+  - `case_22`, `case_24` through `case_30`, `case_32`, and `case_34` still have byte differences from official output.
+  - `case_31_multi_page_navigation` is not implemented in the independent writer yet; current writer remains page0-oriented.
+  - The all-controls stress sample `case_33` is evidence for future mixed-layout work, but not yet promoted as a full supported build path.
+- Regression tests:
+  - `python -m pytest tests\test_tft_patch.py -q`
+  - Result: `18 passed, 30 subtests passed`
+  - `python -m pytest tests\test_editor_tft_build.py tests\test_page_format.py tests\test_scene_layout.py -q`
+  - Result: `27 passed, 2 subtests passed`
+
+## Live Flash Verification: Dual-State Button Case 23 2026-05-11
+
+- Built fixed artifact:
+  - `reverse_usarthmi\live_case23_dual_state\output.tft`
+  - Size: `11,409,432` bytes.
+  - Final TFT checksum valid: `0x5FE98864`.
+  - Byte-for-byte identical to official `C:\Users\SinYu\Desktop\case_for_codex\case_23_dual_state_button\lcd_test.tft`.
+- Uploaded to the real screen:
+  - Port: `COM36`.
+  - Initial baud: `9600`.
+  - Download baud: `921600`.
+  - File size: `11,409,432`.
+  - Chunks sent: `2786`.
+  - Bytes sent: `11,409,432`.
+  - Elapsed: `206.766s`.
+  - Upload log: `reverse_usarthmi\live_case23_dual_state\upload_case23.json`.
+- Runtime verification:
+  - `sendme -> 0`.
+  - Initial `get bt0.val -> 0`.
+  - `get bt0.x -> 0`.
+  - `click bt0 down`, then `get bt0.val -> 1`.
+  - Second `click bt0 down`, then `get bt0.val -> 0`.
+  - `click bt0 up` leaves the current toggle state unchanged.
+- Conclusion:
+  - Type `5` dual-state button is now promoted from offline exact reproduction to live-flashed runtime verified.
+  - Evidence files are under `reverse_usarthmi\live_case23_dual_state`.
+
+## Milestone: Clean Page Rebuild And Live Verification 2026-05-11
+
+- Problem found by camera:
+  - The earlier `case23` byte-perfect upload still displayed old baseline objects (`t0/b0/p0`) because the official target case itself was an appended-object page.
+  - Serial confirmed the same issue: old `b0.txt` and `t0.txt` were still readable.
+- New tooling:
+  - Added `patch_rebuild_page_tft()` in `usarthmi\tft_patch.py`.
+  - Added CLI command:
+    - `python -m usarthmi tft rebuild-page --baseline-tft <seed.tft> --seed-pa <seed 0.pa> --target-pa <target 0.pa> --out <out.tft>`
+  - This mode uses the baseline TFT only as binary shell/template source, then rebuilds the compiled page object/hash/user/mirror tail from the target `0.pa`.
+- Clean test artifact:
+  - Target PA: `reverse_usarthmi\live_clean_case23\clean_bt0.pa`.
+  - Output TFT: `reverse_usarthmi\live_clean_case23\clean_bt0.tft`.
+  - Object list: `page0`, `bt0`.
+  - Removed seed objects: `t0`, `b0`, `p0`.
+  - File size: `11,405,996` bytes.
+  - Final TFT checksum valid: `0x4552544E`.
+- Live upload:
+  - Port: `COM36`.
+  - Initial baud: `9600`.
+  - Download baud: `921600`.
+  - Chunks sent: `2785`.
+  - Bytes sent: `11,405,996`.
+  - Elapsed: `206.469s`.
+  - Upload log: `reverse_usarthmi\live_clean_case23\upload_clean_bt0.json`.
+- Runtime verification:
+  - `sendme -> 0`.
+  - Initial `get bt0.val -> 0`.
+  - `get b0.txt -> 1A invalid_reference`.
+  - `get t0.txt -> 1A invalid_reference`.
+  - `get p0.pic -> 1A invalid_reference`.
+  - `click bt0 down`, then `get bt0.val -> 1`.
+- Camera verification:
+  - Screenshot: `reverse_usarthmi\live_clean_case23\camera_clean_bt0_idx0.jpg`.
+  - Visual result: only the clean dual-state button remains visible; old `ceshi/nihao/C/newt` baseline objects are gone.
+- Regression:
+  - `python -m pytest tests\test_tft_patch.py -q`
+  - Result: `19 passed, 30 subtests passed`.
+
+## Milestone: Case22-30 Clean Smoke And Extra Tail Rules 2026-05-11
+
+- New automation:
+  - Added `tools\live_case_smoke.py`.
+  - It builds a clean page from a local official case, removes baseline `t0/b0/p0`, rebuilds `0.pa` and TFT, optionally uploads to `COM36`, runs serial probes, and captures a camera frame.
+  - It records evidence under `reverse_usarthmi\live_case_smoke\<case_name>\`.
+- Byte-perfect append reproduction promoted:
+  - `case_22_scrolling_text`: fixed type `7` extra runtime code block `09 1f 04 34`.
+  - `case_24_state_button`: fixed type `C` text slot length and `FF` padding.
+  - `case_25_hotspot_touch_area`: fixed type `m` compact string layout and absolute user-record slot handling.
+  - `case_27_waveform_basic`: fixed waveform extra runtime code block, `FF` padding, and primary final waveform anchor.
+  - `case_28_checkbox`: fixed type `8` compact string layout.
+  - `case_29_radio`: fixed type `9` `FF` padding.
+  - `case_30_crop_image`: fixed type `q` compact string layout and `FF` padding.
+  - Existing `case_23_dual_state_button` remains byte-perfect.
+- Live clean-page verification:
+  - `case_22_scrolling_text`: uploaded clean TFT, `sendme -> 0`, old objects invalid, `get g0.txt -> newtxt`, camera captured.
+  - `case_24_state_button`: uploaded clean TFT, `get sw0.txt -> ""`, `get sw0.val -> 0`, click changed `sw0.val -> 1`, camera captured.
+  - `case_25_hotspot_touch_area`: uploaded clean TFT, `get m0.x -> 0`, old objects invalid, camera captured.
+  - `case_26_variable_numeric_string`: clean TFT checksum valid, upload skipped on repeat, `get va0.val -> 123`, `get va1.val -> 0`, `va0.val=123` read back correctly.
+  - `case_28_checkbox`: uploaded clean TFT, `get c0.val -> 1`, click changed `c0.val -> 0`, old objects invalid, camera captured.
+  - `case_29_radio`: uploaded clean TFT, `get r0.val -> 1`, `get r1.val -> 1`, click changed `r0.val -> 0`, old objects invalid, camera captured.
+  - `case_30_crop_image`: uploaded clean TFT, `get q0.x -> 0`, old objects invalid, camera captured.
+- Waveform-specific finding:
+  - Official `case_27_waveform_basic` TFT was uploaded and verified separately.
+  - Official append TFT accepts `add s0.id,0,50`, `add 4,0,50`, and `cle s0.id,255`.
+  - Clean rebuild can read `s0.id/ch/x/w/h/gdc/gdw` and `b1.txt`, and button click works, but `add s0.id,0,50` still returns `12 FF FF FF`.
+  - `12 FF FF FF` is now parsed as `invalid_waveform`, meaning "invalid waveform object id or channel".
+  - Current conclusion: waveform ordinary object/property tables are correct, but clean-page waveform runtime registration still has one unresolved hidden dependency.
+- Evidence files:
+  - `reverse_usarthmi\live_case_smoke_case22_upload_fixed.json`
+  - `reverse_usarthmi\live_case_smoke_case24_upload.json`
+  - `reverse_usarthmi\live_case_smoke_case25_upload.json`
+  - `reverse_usarthmi\live_case_smoke_case26_rerun_skip.json`
+  - `reverse_usarthmi\live_case_smoke_case27_official_upload_probe.json`
+  - `reverse_usarthmi\live_case_smoke_case27_upload_marker.json`
+  - `reverse_usarthmi\live_case_smoke_case27_no_renumber_upload.json`
+  - `reverse_usarthmi\live_case_smoke_case28_upload.json`
+  - `reverse_usarthmi\live_case_smoke_case29_upload.json`
+  - `reverse_usarthmi\live_case_smoke_case30_upload.json`
+- Regression:
+  - `python -m pytest tests\test_tft_patch.py tests\test_protocol.py -q`
+  - Result: `32 passed, 33 subtests passed`.
+
+## Milestone: Case33 Mixed Object Exact Rebuild And Live Flash 2026-05-11
+
+- Scope:
+  - Target fixture: `case_33_all_controls_mixed_stress`.
+  - Object mix: baseline `page0/t0/b0/p0` plus `g0/q0/m0/s0/va0/bt0/c0/r0/sw0`.
+  - This is the first all-new-control mixed append page promoted to byte-perfect generation.
+- Recovered mixed-layout rules:
+  - Mixed descriptor order is not a plain union of single-control prefix insertions.
+  - The writer now learns the canonical mixed descriptor order and mirror sparsity from official `case_33_all_controls_mixed_stress`.
+  - Multi-control prefix insertions are rebuilt from descriptor sequence order, so duplicate/subset descriptors are merged instead of double-inserted.
+  - Mixed primary records use compact lengths for `5/7/8/m/q` when multiple prefix-extended controls share one page.
+  - Mixed waveform primary anchor uses `primary_size + 0x0C`, while the final waveform marker stays `0x114`.
+  - Variable type `4` user records keep the official `FF FF FF` object marker instead of injecting the object id.
+  - State button type `C` user records now treat `0x193F` as a text-pointer record.
+- Offline verification:
+  - Generated TFT: `reverse_usarthmi\live_case33_mixed\generated_case33_mixed.tft`.
+  - Official reference: `C:\Users\SinYu\Desktop\case_for_codex\case_33_all_controls_mixed_stress\lcd_test.tft`.
+  - Result: byte-for-byte identical.
+  - Size: `11,418,160` bytes.
+  - SHA-256: `894e1df61f985f6fe1fd6985f550b4fc3f08f65a93a99668ccfda5256a018988`.
+  - Final TFT checksum valid: `0xFF12E268`.
+- Live flash:
+  - Port: `COM36`.
+  - Initial baud: `9600`.
+  - Download baud: `921600`.
+  - Bytes sent: `11,418,160`.
+  - Chunks sent: `2788`.
+  - Elapsed: `205.828s`.
+  - Result log: `reverse_usarthmi\live_case33_mixed\live_result.json`.
+  - Camera capture: `reverse_usarthmi\live_case33_mixed\camera_after_upload.jpg`.
+- Runtime verification:
+  - `get t0.txt -> nihao`.
+  - `get b0.txt -> ceshi`.
+  - `get g0.txt -> newtxt`.
+  - `get q0.x -> 0`.
+  - `get m0.x -> 0`.
+  - `get s0.id -> 7`.
+  - `get s0.ch -> 1`.
+  - `get va0.val -> 0`.
+  - `get bt0.txt -> newtxt`.
+  - `get bt0.val -> 0`.
+  - `get c0.val -> 1`, then `click c0 down`, then `get c0.val -> 0`.
+  - `get r0.val -> 1`.
+  - `get sw0.val -> 0`, then `click sw0 down`, then `get sw0.val -> 1`.
+  - `add s0.id,0,50` returned no error, so the mixed append waveform runtime registration is valid.
+- Regression:
+  - `python -m py_compile usarthmi\tft_patch.py tests\test_tft_patch.py`
+  - `python -m pytest tests\test_tft_patch.py tests\test_protocol.py -q`
+  - Result: `33 passed, 33 subtests passed`.
+
+## Milestone: Case27 Clean Waveform Runtime Pad Fix 2026-05-11
+
+- Scope:
+  - Target fixture: `case_27_waveform_basic`.
+  - Problem reproduced on hardware: a clean rebuild containing only `page0/s0/b1` could read `s0.id/ch/x` and `b1.txt`, but `add s0.id,0,50`, `add 1,0,50`, and `cle s0.id,255` returned `12 FF FF FF`.
+  - This proved the name hash and ordinary property tables were valid, while waveform runtime registration was missing.
+- Recovered rule:
+  - Clean waveform pages now keep three tiny renamed runtime pad objects before the waveform: `_wfpad1` type `t`, `_wfpad2` type `b`, `_wfpad3` type `p`.
+  - The pads are `1x1` at `(799,479)`, so the public old seed names `t0/b0/p0` stay invalid while `s0` is placed at internal id `4`, matching the proven official append topology.
+  - `tools\live_case_smoke.py` now inserts these pads only for waveform clean-page smoke builds; ordinary append and byte-perfect official fixture reproduction are unchanged.
+- Live flash:
+  - Generated TFT: `reverse_usarthmi\live_case27_fixed_tool\case_27_waveform_basic\clean.tft`.
+  - Probe TFT uploaded to `COM36` at `921600`.
+  - Bytes sent: `11,410,884`.
+  - Chunks sent: `2786`.
+  - Elapsed: `206.015s`.
+  - The fixed tool output is byte-identical to the uploaded probe TFT, so the final tool smoke used safe identical-file skip.
+- Runtime verification:
+  - `sendme -> 0`.
+  - Old seed names are invalid: `get t0.txt`, `get b0.txt`, `get p0.pic` all returned `1A FF FF FF`.
+  - `get s0.id -> 4`.
+  - `get s0.ch -> 1`.
+  - `get s0.x -> 0`.
+  - `add s0.id,0,50` returned no error.
+  - `add 4,0,50` returned no error.
+  - `cle s0.id,255` returned no error.
+  - `get b1.txt -> newtxt`; `click b1,1` is accepted.
+- Evidence:
+  - Tool result: `reverse_usarthmi\live_case27_fixed_tool_upload_skip.json`.
+  - Full upload result: `reverse_usarthmi\live_case27_runtime_pad_probe_upload2_result.json`.
+  - Camera capture: `reverse_usarthmi\live_case27_fixed_tool\case_27_waveform_basic\camera_after_upload.jpg`.
+- Regression:
+  - `python -m py_compile tools\live_case_smoke.py tests\test_tft_patch.py usarthmi\tft_patch.py`
+  - `python -m pytest tests\test_tft_patch.py tests\test_protocol.py -q`
+  - Result: `34 passed, 33 subtests passed`.

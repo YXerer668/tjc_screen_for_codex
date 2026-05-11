@@ -8,6 +8,7 @@ from usarthmi.hmi_inspect import inspect_hmi
 from usarthmi.tft_checksum import inspect_tft_checksum
 from usarthmi.tft_patch import (
     _augment_seed_templates,
+    _build_event_layout,
     _build_primary_block,
     _build_object_event_table,
     _build_page_event_table,
@@ -15,8 +16,10 @@ from usarthmi.tft_patch import (
     _user_slot_count,
     patch_added_object_tft,
     patch_basic_tft,
+    patch_rebuild_page_tft,
 )
 from usarthmi.page_format import load_page_file, parse_page_data
+from tools.live_case_smoke import _load_hmi_page0, _make_clean_page
 
 
 CASE_ROOT = Path(r"C:\Users\SinYu\Desktop\case_for_codex")
@@ -56,6 +59,7 @@ class TftPatchTests(unittest.TestCase):
             "case_04_add_text",
             "case_05_add_button",
             "case_06_add_picture",
+            "case_16_number_basic",
         ):
             with self.subTest(case=case_name), tempfile.TemporaryDirectory() as temp_dir:
                 out = Path(temp_dir) / f"{case_name}.tft"
@@ -197,6 +201,45 @@ class TftPatchTests(unittest.TestCase):
 
         self.assertIn(b"\x08\x00\x00\x00\x09\x0a\x0823 02", event_data)
 
+    def test_event_table_builder_compiles_numeric_field_events(self) -> None:
+        source_pa = EXTRACT_ROOT / "case_19_timer" / "extract" / "0.pa"
+        page = load_page_file(source_pa)
+        button = next(block for block in page.blocks if block.objname == "b0")
+        timer = next(block for block in page.blocks if block.objname == "tm0")
+        button.set_event("codesdown-", ["tm0.en=1"])
+        timer.set_event("codestimer-", ["tm0.en=0"])
+
+        event_layout = _build_event_layout(page.blocks, 0x149, image_button_layout=False)
+
+        timer_slot_start = 0
+        for block in page.blocks:
+            if block.objname == "tm0":
+                break
+            timer_slot_start += _user_slot_count(block)
+        tm0_en_ref = (timer_slot_start + 8).to_bytes(4, "little")
+        self.assertIn(b"\x07\x00\x00\x00\x01" + tm0_en_ref + b"=1", event_layout.data)
+        self.assertIn(b"\x07\x00\x00\x00\x01" + tm0_en_ref + b"=0", event_layout.data)
+        self.assertEqual(event_layout.callbacks[2]["codesdown-"], event_layout.offsets[2] + 12)
+        self.assertEqual(event_layout.callbacks[4]["codestimer-"], event_layout.offsets[4] + 13)
+
+    def test_event_table_builder_compiles_number_increment_event(self) -> None:
+        source_pa = EXTRACT_ROOT / "case_16_number_basic" / "extract" / "0.pa"
+        page = load_page_file(source_pa)
+        button = next(block for block in page.blocks if block.objname == "b0")
+        number = next(block for block in page.blocks if block.objname == "numval")
+        button.set_event("codesdown-", ["numval.val++"])
+
+        event_layout = _build_event_layout(page.blocks, 0x149, image_button_layout=False)
+
+        number_slot_start = 0
+        for block in page.blocks:
+            if block is number:
+                break
+            number_slot_start += _user_slot_count(block)
+        numval_ref = (number_slot_start + 27).to_bytes(4, "little")
+        self.assertIn(b"\x07\x00\x00\x00\x01" + numval_ref + b"++", event_layout.data)
+        self.assertEqual(event_layout.callbacks[2]["codesdown-"], event_layout.offsets[2] + 12)
+
     def test_checksum_matches_official_cases(self) -> None:
         for case_name in (
             "case_00_baseline",
@@ -278,6 +321,257 @@ class TftPatchTests(unittest.TestCase):
             self.assertTrue(info["valid"])
 
     @unittest.skipUnless(
+        all((CASE_ROOT / name / "lcd_test.HMI").exists() for name in (
+            "case_22_scrolling_text",
+            "case_23_dual_state_button",
+            "case_24_state_button",
+            "case_25_hotspot_touch_area",
+            "case_26_variable_numeric_string",
+            "case_27_waveform_basic",
+            "case_28_checkbox",
+            "case_29_radio",
+            "case_30_crop_image",
+        )),
+        "local new-control fixtures are not available",
+    )
+    def test_added_object_patch_accepts_new_case22_to_case30_controls(self) -> None:
+        baseline_tft = CASE_ROOT / "case_00_baseline" / "lcd_test.tft"
+        baseline_pa = EXTRACT_ROOT / "case_00_baseline" / "extract" / "0.pa"
+        for case_name in (
+            "case_22_scrolling_text",
+            "case_23_dual_state_button",
+            "case_24_state_button",
+            "case_25_hotspot_touch_area",
+            "case_26_variable_numeric_string",
+            "case_27_waveform_basic",
+            "case_28_checkbox",
+            "case_29_radio",
+            "case_30_crop_image",
+        ):
+            with self.subTest(case=case_name), tempfile.TemporaryDirectory() as temp_dir:
+                out = Path(temp_dir) / "new_control.tft"
+
+                result = patch_added_object_tft(
+                    baseline_tft,
+                    baseline_pa=baseline_pa,
+                    target_pa=EXTRACT_ROOT / case_name / "extract" / "0.pa",
+                    out_tft=out,
+                ).to_dict()
+
+                self.assertGreaterEqual(result["added_count"], 1)
+                info = inspect_tft_checksum(out)
+                self.assertTrue(info["valid"])
+
+    @unittest.skipUnless(
+        (CASE_ROOT / "case_23_dual_state_button" / "lcd_test.tft").exists()
+        and (EXTRACT_ROOT / "case_23_dual_state_button" / "extract" / "0.pa").exists(),
+        "local dual-state button fixture is not available",
+    )
+    def test_added_object_patch_reproduces_dual_state_button_case_exactly(self) -> None:
+        baseline_tft = CASE_ROOT / "case_00_baseline" / "lcd_test.tft"
+        baseline_pa = EXTRACT_ROOT / "case_00_baseline" / "extract" / "0.pa"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out = Path(temp_dir) / "case_23_dual_state_button.tft"
+
+            patch_added_object_tft(
+                baseline_tft,
+                baseline_pa=baseline_pa,
+                target_pa=EXTRACT_ROOT / "case_23_dual_state_button" / "extract" / "0.pa",
+                out_tft=out,
+            )
+
+            self.assertEqual(out.read_bytes(), (CASE_ROOT / "case_23_dual_state_button" / "lcd_test.tft").read_bytes())
+
+    @unittest.skipUnless(
+        (CASE_ROOT / "case_22_scrolling_text" / "lcd_test.tft").exists()
+        and (EXTRACT_ROOT / "case_22_scrolling_text" / "extract" / "0.pa").exists(),
+        "local scrolling text fixture is not available",
+    )
+    def test_added_object_patch_reproduces_scrolling_text_case_exactly(self) -> None:
+        baseline_tft = CASE_ROOT / "case_00_baseline" / "lcd_test.tft"
+        baseline_pa = EXTRACT_ROOT / "case_00_baseline" / "extract" / "0.pa"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out = Path(temp_dir) / "case_22_scrolling_text.tft"
+
+            patch_added_object_tft(
+                baseline_tft,
+                baseline_pa=baseline_pa,
+                target_pa=EXTRACT_ROOT / "case_22_scrolling_text" / "extract" / "0.pa",
+                out_tft=out,
+            )
+
+            self.assertEqual(out.read_bytes(), (CASE_ROOT / "case_22_scrolling_text" / "lcd_test.tft").read_bytes())
+
+    @unittest.skipUnless(
+        (CASE_ROOT / "case_24_state_button" / "lcd_test.tft").exists()
+        and (EXTRACT_ROOT / "case_24_state_button" / "extract" / "0.pa").exists(),
+        "local state-button fixture is not available",
+    )
+    def test_added_object_patch_reproduces_state_button_case_exactly(self) -> None:
+        baseline_tft = CASE_ROOT / "case_00_baseline" / "lcd_test.tft"
+        baseline_pa = EXTRACT_ROOT / "case_00_baseline" / "extract" / "0.pa"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out = Path(temp_dir) / "case_24_state_button.tft"
+
+            patch_added_object_tft(
+                baseline_tft,
+                baseline_pa=baseline_pa,
+                target_pa=EXTRACT_ROOT / "case_24_state_button" / "extract" / "0.pa",
+                out_tft=out,
+            )
+
+            self.assertEqual(out.read_bytes(), (CASE_ROOT / "case_24_state_button" / "lcd_test.tft").read_bytes())
+
+    @unittest.skipUnless(
+        (CASE_ROOT / "case_25_hotspot_touch_area" / "lcd_test.tft").exists()
+        and (EXTRACT_ROOT / "case_25_hotspot_touch_area" / "extract" / "0.pa").exists(),
+        "local hotspot fixture is not available",
+    )
+    def test_added_object_patch_reproduces_hotspot_case_exactly(self) -> None:
+        baseline_tft = CASE_ROOT / "case_00_baseline" / "lcd_test.tft"
+        baseline_pa = EXTRACT_ROOT / "case_00_baseline" / "extract" / "0.pa"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out = Path(temp_dir) / "case_25_hotspot_touch_area.tft"
+
+            patch_added_object_tft(
+                baseline_tft,
+                baseline_pa=baseline_pa,
+                target_pa=EXTRACT_ROOT / "case_25_hotspot_touch_area" / "extract" / "0.pa",
+                out_tft=out,
+            )
+
+            self.assertEqual(out.read_bytes(), (CASE_ROOT / "case_25_hotspot_touch_area" / "lcd_test.tft").read_bytes())
+
+    @unittest.skipUnless(
+        (CASE_ROOT / "case_27_waveform_basic" / "lcd_test.tft").exists()
+        and (EXTRACT_ROOT / "case_27_waveform_basic" / "extract" / "0.pa").exists(),
+        "local waveform fixture is not available",
+    )
+    def test_added_object_patch_reproduces_waveform_case_exactly(self) -> None:
+        baseline_tft = CASE_ROOT / "case_00_baseline" / "lcd_test.tft"
+        baseline_pa = EXTRACT_ROOT / "case_00_baseline" / "extract" / "0.pa"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out = Path(temp_dir) / "case_27_waveform_basic.tft"
+
+            patch_added_object_tft(
+                baseline_tft,
+                baseline_pa=baseline_pa,
+                target_pa=EXTRACT_ROOT / "case_27_waveform_basic" / "extract" / "0.pa",
+                out_tft=out,
+            )
+
+            self.assertEqual(out.read_bytes(), (CASE_ROOT / "case_27_waveform_basic" / "lcd_test.tft").read_bytes())
+
+    @unittest.skipUnless(
+        all(
+            (CASE_ROOT / case_name / "lcd_test.tft").exists()
+            and (EXTRACT_ROOT / case_name / "extract" / "0.pa").exists()
+            for case_name in ("case_28_checkbox", "case_29_radio", "case_30_crop_image")
+        ),
+        "local checkbox/radio/crop fixtures are not available",
+    )
+    def test_added_object_patch_reproduces_case28_to_case30_exactly(self) -> None:
+        baseline_tft = CASE_ROOT / "case_00_baseline" / "lcd_test.tft"
+        baseline_pa = EXTRACT_ROOT / "case_00_baseline" / "extract" / "0.pa"
+        for case_name in ("case_28_checkbox", "case_29_radio", "case_30_crop_image"):
+            with self.subTest(case=case_name), tempfile.TemporaryDirectory() as temp_dir:
+                out = Path(temp_dir) / f"{case_name}.tft"
+
+                patch_added_object_tft(
+                    baseline_tft,
+                    baseline_pa=baseline_pa,
+                    target_pa=EXTRACT_ROOT / case_name / "extract" / "0.pa",
+                    out_tft=out,
+                )
+
+                self.assertEqual(out.read_bytes(), (CASE_ROOT / case_name / "lcd_test.tft").read_bytes())
+
+    @unittest.skipUnless(
+        (CASE_ROOT / "case_33_all_controls_mixed_stress" / "lcd_test.tft").exists()
+        and (EXTRACT_ROOT / "case_33_all_controls_mixed_stress" / "extract" / "0.pa").exists(),
+        "local all-controls mixed fixture is not available",
+    )
+    def test_added_object_patch_reproduces_all_controls_mixed_case_exactly(self) -> None:
+        baseline_tft = CASE_ROOT / "case_00_baseline" / "lcd_test.tft"
+        baseline_pa = EXTRACT_ROOT / "case_00_baseline" / "extract" / "0.pa"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out = Path(temp_dir) / "case_33_all_controls_mixed_stress.tft"
+
+            patch_added_object_tft(
+                baseline_tft,
+                baseline_pa=baseline_pa,
+                target_pa=EXTRACT_ROOT / "case_33_all_controls_mixed_stress" / "extract" / "0.pa",
+                out_tft=out,
+            )
+
+            self.assertEqual(out.read_bytes(), (CASE_ROOT / "case_33_all_controls_mixed_stress" / "lcd_test.tft").read_bytes())
+
+    @unittest.skipUnless(
+        (CASE_ROOT / "case_23_dual_state_button" / "lcd_test.tft").exists()
+        and (EXTRACT_ROOT / "case_23_dual_state_button" / "extract" / "0.pa").exists(),
+        "local dual-state button fixture is not available",
+    )
+    def test_rebuild_page_can_drop_seed_objects_for_clean_dual_state_button(self) -> None:
+        baseline_tft = CASE_ROOT / "case_00_baseline" / "lcd_test.tft"
+        seed_pa = EXTRACT_ROOT / "case_00_baseline" / "extract" / "0.pa"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            target_pa = temp / "clean_bt0.pa"
+            out = temp / "clean_bt0.tft"
+
+            page = load_page_file(seed_pa)
+            page.blocks = [page.blocks[0].clone()]
+            button = _load_case_last_block("case_23_dual_state_button")
+            _configure_added_block(button, object_id=1, name="bt0", x=120, y=120, w=180, h=80)
+            page.blocks.append(button)
+            target_pa.write_bytes(page.serialize())
+
+            result = patch_rebuild_page_tft(
+                baseline_tft,
+                seed_pa=seed_pa,
+                target_pa=target_pa,
+                out_tft=out,
+            ).to_dict()
+
+            self.assertEqual(result["object_count"], 2)
+            self.assertEqual(result["removed_seed_objects"], ["t0", "b0", "p0"])
+            self.assertEqual([item["name"] for item in result["objects"]], ["page0", "bt0"])
+            self.assertTrue(inspect_tft_checksum(out)["valid"])
+            rebuilt_seed = _load_tail_seed(out, target_pa, load_page_file(target_pa))
+            self.assertEqual(set(rebuilt_seed.hash_by_name), {"page0", "bt0"})
+
+    @unittest.skipUnless(
+        (CASE_ROOT / "case_27_waveform_basic" / "lcd_test.HMI").exists(),
+        "local waveform fixture is not available",
+    )
+    def test_live_clean_waveform_inserts_runtime_pads(self) -> None:
+        baseline_tft = CASE_ROOT / "case_00_baseline" / "lcd_test.tft"
+        seed_pa = EXTRACT_ROOT / "case_00_baseline" / "extract" / "0.pa"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            target_pa = temp / "clean_waveform_runtime_pad.pa"
+            out = temp / "clean_waveform_runtime_pad.tft"
+
+            seed_page = load_page_file(seed_pa)
+            target_page = _load_hmi_page0(CASE_ROOT / "case_27_waveform_basic" / "lcd_test.HMI")
+            clean_page, _, target_blocks, runtime_pads = _make_clean_page(seed_page, target_page)
+            target_pa.write_bytes(clean_page.serialize())
+
+            self.assertEqual([block.objname for block in runtime_pads], ["_wfpad1", "_wfpad2", "_wfpad3"])
+            self.assertEqual([(block.objname, _field_int_for_test(block, "id")) for block in target_blocks], [("s0", 4), ("b1", 5)])
+            self.assertEqual([block.objname for block in clean_page.blocks], ["page0", "_wfpad1", "_wfpad2", "_wfpad3", "s0", "b1"])
+
+            result = patch_rebuild_page_tft(
+                baseline_tft,
+                seed_pa=seed_pa,
+                target_pa=target_pa,
+                out_tft=out,
+            ).to_dict()
+
+            self.assertEqual(result["object_count"], 6)
+            self.assertTrue(inspect_tft_checksum(out)["valid"])
+
+    @unittest.skipUnless(
         (CASE_ROOT / "case_19_timer" / "lcd_test.tft").exists()
         and (EXTRACT_ROOT / "case_19_timer" / "extract" / "0.pa").exists(),
         "local timer fixture is not available",
@@ -327,7 +621,11 @@ class TftPatchTests(unittest.TestCase):
             seed = _load_tail_seed(out, target_pa, generated_page)
             base_seed = _load_tail_seed(baseline_tft, baseline_pa, load_page_file(baseline_pa))
             _augment_seed_templates(base_seed, {block.type_code for block in generated_page.blocks})
-            _, _, text_pointer_by_id, _ = _build_primary_block(base_seed, generated_page.blocks)
+            _, _, text_pointer_by_id, _ = _build_primary_block(
+                base_seed,
+                generated_page.blocks,
+                event_callbacks=[{} for _ in generated_page.blocks],
+            )
             qr_index = next(index for index, block in enumerate(generated_page.blocks) if block.objname == "qr1")
             slot_start = sum(_user_slot_count(block) for block in generated_page.blocks[:qr_index])
             qr_text_slot = slot_start + 23
@@ -369,6 +667,13 @@ def _configure_added_block(block, *, object_id: int, name: str, x: int, y: int, 
     block.set_int("h", h, width=2)
     block.set_int("endx", x + w - 1, width=2)
     block.set_int("endy", y + h - 1, width=2)
+
+
+def _field_int_for_test(block, name: str) -> int | None:
+    field = block.get_field(name)
+    if field is None or not field.value:
+        return None
+    return int.from_bytes(field.value, "little")
 
 
 if __name__ == "__main__":
