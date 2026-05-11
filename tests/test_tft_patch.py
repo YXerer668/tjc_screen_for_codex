@@ -7,12 +7,15 @@ import unittest
 from usarthmi.hmi_inspect import inspect_hmi
 from usarthmi.tft_checksum import inspect_tft_checksum
 from usarthmi.tft_patch import (
+    _augment_seed_templates,
+    _build_primary_block,
     _build_object_event_table,
     _build_page_event_table,
+    _load_tail_seed,
+    _user_slot_count,
     patch_added_object_tft,
     patch_basic_tft,
 )
-from usarthmi.tft_toolchain import TftToolchainError
 from usarthmi.page_format import load_page_file, parse_page_data
 
 
@@ -247,7 +250,7 @@ class TftPatchTests(unittest.TestCase):
                 info = inspect_tft_checksum(out)
                 self.assertTrue(info["valid"])
 
-    def test_added_object_patch_rejects_mixed_extra_visual_layouts(self) -> None:
+    def test_added_object_patch_accepts_mixed_extra_visual_layouts(self) -> None:
         baseline_tft = CASE_ROOT / "case_00_baseline" / "lcd_test.tft"
         baseline_pa = EXTRACT_ROOT / "case_00_baseline" / "extract" / "0.pa"
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -262,13 +265,56 @@ class TftPatchTests(unittest.TestCase):
             page.blocks.extend([slider, progress])
             target_pa.write_bytes(page.serialize())
 
-            with self.assertRaises(TftToolchainError):
-                patch_added_object_tft(
-                    baseline_tft,
-                    baseline_pa=baseline_pa,
-                    target_pa=target_pa,
-                    out_tft=out,
-                )
+            result = patch_added_object_tft(
+                baseline_tft,
+                baseline_pa=baseline_pa,
+                target_pa=target_pa,
+                out_tft=out,
+            ).to_dict()
+
+            self.assertEqual(result["added_count"], 2)
+            self.assertEqual(result["section_offsets"]["prefix_delta"]["value"], 40)
+            info = inspect_tft_checksum(out)
+            self.assertTrue(info["valid"])
+
+    def test_added_object_patch_keeps_qrcode_text_pointer_separate(self) -> None:
+        baseline_tft = CASE_ROOT / "case_00_baseline" / "lcd_test.tft"
+        baseline_pa = EXTRACT_ROOT / "case_00_baseline" / "extract" / "0.pa"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            target_pa = temp / "qr_text_pointer.pa"
+            out = temp / "qr_text_pointer.tft"
+            page = load_page_file(baseline_pa)
+            title = _load_case_last_block("case_04_add_text")
+            qr = _load_case_last_block("case_21_qrcode")
+            _configure_added_block(title, object_id=4, name="title", x=40, y=24, w=260, h=48)
+            title.set_string("txt", "TITLE TEXT")
+            title.set_int("txt_maxl", 32, width=2)
+            _configure_added_block(qr, object_id=5, name="qr1", x=360, y=80, w=150, h=150)
+            qr.set_string("txt", "QR TEXT")
+            qr.set_int("txt_maxl", 30, width=2)
+            page.blocks.extend([title, qr])
+            target_pa.write_bytes(page.serialize())
+
+            patch_result = patch_added_object_tft(
+                baseline_tft,
+                baseline_pa=baseline_pa,
+                target_pa=target_pa,
+                out_tft=out,
+            )
+
+            generated_page = load_page_file(target_pa)
+            seed = _load_tail_seed(out, target_pa, generated_page)
+            base_seed = _load_tail_seed(baseline_tft, baseline_pa, load_page_file(baseline_pa))
+            _augment_seed_templates(base_seed, {block.type_code for block in generated_page.blocks})
+            _, _, text_pointer_by_id, _ = _build_primary_block(base_seed, generated_page.blocks)
+            qr_index = next(index for index, block in enumerate(generated_page.blocks) if block.objname == "qr1")
+            slot_start = sum(_user_slot_count(block) for block in generated_page.blocks[:qr_index])
+            qr_text_slot = slot_start + 23
+            tail = seed.raw[seed.object_start:]
+            user_offset = patch_result.section_offsets["user"]
+            record = tail[user_offset + qr_text_slot * 24 : user_offset + (qr_text_slot + 1) * 24]
+            self.assertEqual(int.from_bytes(record[4:8], "little"), text_pointer_by_id[5])
 
 def _build_multi_added_page():
     baseline = load_page_file(EXTRACT_ROOT / "case_00_baseline" / "extract" / "0.pa")

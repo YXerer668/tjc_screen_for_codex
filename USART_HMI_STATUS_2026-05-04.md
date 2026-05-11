@@ -1469,3 +1469,30 @@ Until that step is complete, all screen changes remain either:
   - `reverse_usarthmi\extra_controls_demo\verify_generated_case18_gauge_exact.json`
   - `reverse_usarthmi\extra_controls_demo\verify_generated_case21_qrcode.json`
   - `reverse_usarthmi\extra_controls_demo\verify_generated_case17_slider.json`
+
+## Finding: Mixed Extra Visual Controls 2026-05-11
+
+- Status: mixed slider + progress + gauge + QR code on one page is now runtime-usable on the real `COM36` panel.
+- Root cause:
+  - The extra-control prefix table is a descriptor sequence from offset `0x3E`.
+  - Mixed layouts need mirror records sized from the combined descriptor sequence, not the maximum single-control mirror width.
+  - Equivalent prefix insertions must be canonicalized before dedupe; otherwise repeated-byte descriptors can be inserted twice in mixed layouts.
+- Additional QR fix:
+  - QR code text uses a `0x1F3F` user-record text pointer slot.
+  - Treating it as `value_base + delta` worked by coincidence in a single-QR fixture, but made `qr1.txt` share the preceding title text buffer when extra text objects existed.
+- Live validation after flashing `reverse_usarthmi\extra_controls_demo\output_mixed_extra_descriptor_merge_qrfix.tft` to `COM36`:
+  - `sendme -> 0`
+  - `sld1.val` read `50`, set to `80`, read back `80`; `sld1.x -> 56`
+  - `bar1.val` read `60`, set to `85`, read back `85`; `bar1.x -> 56`
+  - `gauge1.val` read `75`, set to `35`, read back `35`; `gauge1.x -> 455`
+  - `qr1.txt` read `Hello USART HMI`, set to `HELLO`, read back `HELLO`; `qr1.x -> 560`
+  - `title.txt` stayed `EXTRA CONTROLS` after `qr1.txt` was changed, confirming the QR text buffer is no longer aliased.
+- Evidence:
+  - Build report: `reverse_usarthmi\extra_controls_demo\output_mixed_extra_descriptor_merge_qrfix.json`
+  - Upload log: `reverse_usarthmi\extra_controls_demo\upload_mixed_extra_descriptor_merge_qrfix.json`
+  - Runtime log: `reverse_usarthmi\extra_controls_demo\verify_mixed_extra_descriptor_merge_qrfix.json`
+  - Reduced same-type control: `reverse_usarthmi\extra_controls_demo\two_sliders\verify_result.json`
+  - Reduced cross-type control: `reverse_usarthmi\extra_controls_demo\slider_progress\verify_descriptor_merge.json`
+- Regression tests:
+  - `python -m pytest tests\test_tft_patch.py tests\test_editor_tft_build.py tests\test_page_format.py tests\test_scene_layout.py -q`
+  - Result: `36 passed, 22 subtests passed`

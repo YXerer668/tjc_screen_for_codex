@@ -48,6 +48,7 @@ IMAGE_BUTTON_MIRROR_VALUE_COUNT = 42
 IMAGE_BUTTON_MIRROR_EXTRA_INDEX = 17
 IMAGE_BUTTON_PREFIX_INSERT_OFFSET = 0x86
 IMAGE_BUTTON_PREFIX_INSERT = bytes.fromhex("92 48 C9 76")
+PREFIX_DESCRIPTOR_START = 0x3E
 IMAGE_BUTTON_MIRROR_RELATIVE_VALUES = (
     9,
     10,
@@ -206,6 +207,7 @@ class _TailSeed:
     user_templates: dict[str, list[_UserRecordTemplate]]
     mirror_templates: dict[str, list[int | None]]
     mirror_layout_templates: dict[str, dict[str, list[int | None]]]
+    mirror_descriptor_sequences: dict[str, list[bytes]]
     hash_by_name: dict[str, int]
 
 
@@ -338,7 +340,6 @@ def patch_added_object_tft(
 
     seed = _load_tail_seed(baseline_tft_path, baseline_pa_path, baseline_page)
     _augment_seed_templates(seed, {block.type_code for block in target_page.blocks})
-    _validate_extra_layout_mix(seed, target_page.blocks)
     tail, sections = _build_added_object_tail(seed, target_page.blocks)
     payload = bytearray(seed.raw[: seed.object_start] + tail)
     image_button_layout = _uses_full_image_button_layout(target_page.blocks)
@@ -490,6 +491,7 @@ def _augment_seed_templates(seed: _TailSeed, needed_types: set[str]) -> None:
                 key: list(value)
                 for key, value in case_seed.mirror_templates.items()
             }
+            seed.mirror_descriptor_sequences[type_code] = _prefix_descriptor_sequence(case_seed.compiled_prefix)
             seed.prefix_inserts[type_code] = _derive_prefix_insertions_for_case(seed, case_seed, case_page)
         else:
             unresolved.append(type_code)
@@ -599,7 +601,11 @@ def _load_tail_seed(
             if record == b"\x00" * 24:
                 continue
             words = [int.from_bytes(record[index : index + 4], "little") for index in range(0, 24, 4)]
-            word1_mode = "text_pointer" if words[5] == 0x0B3F else "value_delta"
+            word1_mode = (
+                "text_pointer"
+                if words[5] == 0x0B3F or (type_code == ":" and words[5] == 0x1F3F)
+                else "value_delta"
+            )
             entries.append(
                 _UserRecordTemplate(
                     slot_index=slot_index,
@@ -653,6 +659,7 @@ def _load_tail_seed(
         user_templates=user_templates,
         mirror_templates=mirror_templates,
         mirror_layout_templates={},
+        mirror_descriptor_sequences={"": _prefix_descriptor_sequence(compiled_prefix)},
         hash_by_name=hash_by_name,
     )
 
@@ -676,6 +683,19 @@ def _find_hash_block(tail: bytes, expected_hash_by_id: dict[int, int]) -> tuple[
         if valid and set(seen) == set(expected_hash_by_id):
             return offset, data
     raise TftToolchainError("Unable to locate compiled TFT object hash/index block")
+
+
+def _prefix_descriptor_sequence(prefix: bytes) -> list[bytes]:
+    end = int.from_bytes(prefix[:4], "little")
+    if end < PREFIX_DESCRIPTOR_START or end > len(prefix):
+        raise TftToolchainError("TFT prefix descriptor table has an invalid end offset")
+    descriptor_bytes = prefix[PREFIX_DESCRIPTOR_START:end]
+    if len(descriptor_bytes) % 4:
+        raise TftToolchainError("TFT prefix descriptor table is not 4-byte aligned")
+    return [
+        descriptor_bytes[offset : offset + 4]
+        for offset in range(0, len(descriptor_bytes), 4)
+    ]
 
 
 def _find_mirror_record_offsets(tail: bytes, mirror_start: int, blocks: list[PageBlock]) -> list[int]:
@@ -707,6 +727,7 @@ def _build_added_object_tail(
         image_button_layout=image_button_layout,
         extra_insertions=_prefix_insertions_for_blocks(seed, target_blocks),
     )
+    descriptor_sequence = _prefix_descriptor_sequence(prefix_head) if mirror_layout_type is not None else None
     event_layout = _build_event_layout(target_blocks, len(prefix_head), image_button_layout=image_button_layout)
     prefix = prefix_head + event_layout.data
     hash_offset = len(prefix)
@@ -762,7 +783,9 @@ def _build_added_object_tail(
                 target_blocks,
                 image_button_layout=image_button_layout,
                 mirror_layout_type=mirror_layout_type,
+                descriptor_sequence=descriptor_sequence,
             ),
+            descriptor_sequence=descriptor_sequence,
             hash_offset=hash_offset,
             user_offset=user_offset,
             primary_pre_string_len=primary_pre_string_len,
@@ -1158,7 +1181,13 @@ def _derive_prefix_insertions_for_case(
     matcher = SequenceMatcher(None, generated_prefix, actual_prefix, autojunk=False)
     for tag, first_start, first_end, second_start, second_end in matcher.get_opcodes():
         if tag == "insert":
-            insertions.append((first_start, actual_prefix[second_start:second_end]))
+            insertions.append(
+                _canonical_prefix_insertion(
+                    generated_prefix,
+                    first_start,
+                    actual_prefix[second_start:second_end],
+                )
+            )
 
     patched = _apply_prefix_insertions(generated_prefix, insertions)
     if patched != actual_prefix:
@@ -1188,7 +1217,10 @@ def _mirror_value_count_for_layout(
     *,
     image_button_layout: bool,
     mirror_layout_type: str | None,
+    descriptor_sequence: list[bytes] | None = None,
 ) -> int:
+    if descriptor_sequence is not None and not image_button_layout:
+        return len(descriptor_sequence)
     layout_templates = seed.mirror_layout_templates.get(mirror_layout_type or "", {})
     widths = [
         len(layout_templates.get(block.type_code, seed.mirror_templates[block.type_code]))
@@ -1252,6 +1284,22 @@ def _apply_prefix_insertions(prefix: bytes, insertions: list[tuple[int, bytes]])
     return bytes(patched)
 
 
+def _canonical_prefix_insertion(prefix: bytes, offset: int, payload: bytes) -> tuple[int, bytes]:
+    """Choose a stable representation for ambiguous repeated-byte insertions.
+
+    SequenceMatcher may report the same official insertion at two neighboring
+    offsets when the payload repeats bytes already present in the seed prefix.
+    Single-control cases still reproduce exactly either way, but mixed layouts
+    must dedupe these equivalent insertions before applying several control
+    templates at once.
+    """
+
+    while payload and offset < len(prefix) and payload[0] == prefix[offset]:
+        payload = payload[1:] + prefix[offset : offset + 1]
+        offset += 1
+    return offset, payload
+
+
 def _add_prefix_u32(buffer: bytearray, offset: int, delta: int) -> None:
     value = int.from_bytes(buffer[offset : offset + 4], "little")
     buffer[offset : offset + 4] = (value + delta).to_bytes(4, "little")
@@ -1280,6 +1328,7 @@ def _build_mirror_records(
     *,
     mirror_layout_type: str | None,
     mirror_value_count: int,
+    descriptor_sequence: list[bytes] | None,
     hash_offset: int,
     user_offset: int,
     primary_pre_string_len: int,
@@ -1312,6 +1361,7 @@ def _build_mirror_records(
             image_button_layout=image_button_layout,
             mirror_layout_type=mirror_layout_type,
             mirror_value_count=mirror_value_count,
+            descriptor_sequence=descriptor_sequence,
         ):
             value = 0xFFFF if item is None else slot_start + item
             record.extend(value.to_bytes(2, "little"))
@@ -1333,12 +1383,16 @@ def _mirror_values_for_block(
     image_button_layout: bool,
     mirror_layout_type: str | None,
     mirror_value_count: int,
+    descriptor_sequence: list[bytes] | None = None,
 ) -> list[int | None]:
     if image_button_layout and block.type_code == "b" and _field_int(block, "sta") == 2:
         values = list(IMAGE_BUTTON_MIRROR_RELATIVE_VALUES)
     else:
-        layout_templates = seed.mirror_layout_templates.get(mirror_layout_type or "", {})
-        values = list(layout_templates.get(block.type_code, seed.mirror_templates[block.type_code]))
+        if descriptor_sequence is not None:
+            values = _mirror_values_by_descriptors(seed, block, descriptor_sequence)
+        else:
+            layout_templates = seed.mirror_layout_templates.get(mirror_layout_type or "", {})
+            values = list(layout_templates.get(block.type_code, seed.mirror_templates[block.type_code]))
         if image_button_layout:
             values.insert(IMAGE_BUTTON_MIRROR_EXTRA_INDEX, None)
     if len(values) > mirror_value_count:
@@ -1349,6 +1403,39 @@ def _mirror_values_for_block(
     if len(values) < mirror_value_count:
         values.extend([None] * (mirror_value_count - len(values)))
     return values
+
+
+def _mirror_values_by_descriptors(
+    seed: _TailSeed,
+    block: PageBlock,
+    descriptor_sequence: list[bytes],
+) -> list[int | None]:
+    type_code = block.type_code
+    value_by_descriptor: dict[bytes, int | None] = {}
+
+    def merge(sequence: list[bytes], values: list[int | None]) -> None:
+        for descriptor, value in zip(sequence, values):
+            existing = value_by_descriptor.get(descriptor)
+            if existing is not None and value is not None and existing != value:
+                raise TftToolchainError(
+                    f"Conflicting TFT mirror descriptor mapping for object type {type_code!r}"
+                )
+            if descriptor not in value_by_descriptor or value_by_descriptor[descriptor] is None:
+                value_by_descriptor[descriptor] = value
+
+    base_sequence = seed.mirror_descriptor_sequences[""]
+    if type_code in seed.mirror_descriptor_sequences:
+        merge(seed.mirror_descriptor_sequences[type_code], seed.mirror_layout_templates[type_code][type_code])
+    else:
+        merge(base_sequence, seed.mirror_templates[type_code])
+        for layout_type, sequence in seed.mirror_descriptor_sequences.items():
+            if not layout_type:
+                continue
+            layout_templates = seed.mirror_layout_templates.get(layout_type, {})
+            if type_code in layout_templates:
+                merge(sequence, layout_templates[type_code])
+
+    return [value_by_descriptor.get(descriptor) for descriptor in descriptor_sequence]
 
 
 def _user_slot_count(block: PageBlock) -> int:
