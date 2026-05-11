@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from usarthmi.hmi_inspect import inspect_hmi
 from usarthmi.tft_checksum import inspect_tft_checksum
 from usarthmi.tft_patch import (
     _build_object_event_table,
@@ -11,7 +12,7 @@ from usarthmi.tft_patch import (
     patch_added_object_tft,
     patch_basic_tft,
 )
-from usarthmi.page_format import load_page_file
+from usarthmi.page_format import load_page_file, parse_page_data
 
 
 CASE_ROOT = Path(r"C:\Users\SinYu\Desktop\case_for_codex")
@@ -206,6 +207,47 @@ class TftPatchTests(unittest.TestCase):
                 info = inspect_tft_checksum(CASE_ROOT / case_name / "lcd_test.tft")
                 self.assertTrue(info["valid"])
 
+    @unittest.skipUnless(
+        all((CASE_ROOT / name / "lcd_test.HMI").exists() for name in (
+            "case_17_slider",
+            "case_18_gauge",
+            "case_20_progress",
+            "case_21_qrcode",
+        )),
+        "local extra-control fixtures are not available",
+    )
+    def test_added_object_patch_accepts_extra_visual_controls(self) -> None:
+        baseline_tft = CASE_ROOT / "case_00_baseline" / "lcd_test.tft"
+        baseline_pa = EXTRACT_ROOT / "case_00_baseline" / "extract" / "0.pa"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            target_pa = temp / "extra_visual.pa"
+            out = temp / "extra_visual.tft"
+            page = load_page_file(baseline_pa)
+
+            slider = _load_case_last_block("case_17_slider")
+            progress = _load_case_last_block("case_20_progress")
+            gauge = _load_case_last_block("case_18_gauge")
+            qr = _load_case_last_block("case_21_qrcode")
+            _configure_added_block(slider, object_id=4, name="sld1", x=56, y=118, w=330, h=40)
+            _configure_added_block(progress, object_id=5, name="bar1", x=56, y=206, w=330, h=30)
+            _configure_added_block(gauge, object_id=6, name="gauge1", x=455, y=82, w=240, h=240)
+            _configure_added_block(qr, object_id=7, name="qr1", x=560, y=290, w=150, h=150)
+            page.blocks.extend([slider, progress, gauge, qr])
+            target_pa.write_bytes(page.serialize())
+
+            result = patch_added_object_tft(
+                baseline_tft,
+                baseline_pa=baseline_pa,
+                target_pa=target_pa,
+                out_tft=out,
+            ).to_dict()
+
+            self.assertEqual(result["added_count"], 4)
+            self.assertEqual([item["type"] for item in result["added_objects"]], ["\x01", "j", "z", ":"])
+            info = inspect_tft_checksum(out)
+            self.assertTrue(info["valid"])
+
 def _build_multi_added_page():
     baseline = load_page_file(EXTRACT_ROOT / "case_00_baseline" / "extract" / "0.pa")
     text = load_page_file(EXTRACT_ROOT / "case_04_add_text" / "extract" / "0.pa").blocks[-1].clone()
@@ -220,6 +262,14 @@ def _build_multi_added_page():
 
     baseline.blocks = [*baseline.blocks, text, button, picture]
     return baseline
+
+
+def _load_case_last_block(case_name: str):
+    hmi_path = CASE_ROOT / case_name / "lcd_test.HMI"
+    inspection = inspect_hmi(hmi_path)
+    raw = hmi_path.read_bytes()
+    entry = next(item for item in inspection.entries if item.name == "0.pa")
+    return parse_page_data(raw[entry.data_offset : entry.data_offset + entry.length]).blocks[-1].clone()
 
 
 def _configure_added_block(block, *, object_id: int, name: str, x: int, y: int, w: int, h: int) -> None:

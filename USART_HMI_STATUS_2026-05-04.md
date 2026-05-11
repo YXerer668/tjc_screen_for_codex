@@ -1374,3 +1374,47 @@ Until that step is complete, all screen changes remain either:
 - Verification:
   - Focused tests passed: `13 passed`.
   - Full Python test suite passed after these updates: `60 passed, 25 subtests passed`.
+
+## Finding: Experimental Extra Visual Controls TFT 2026-05-11
+
+- Goal:
+  - Try the remaining official visual controls from `case_17` through `case_21` in one independently generated TFT, without using the official GUI compiler.
+- Implemented generator changes:
+  - Added compiled record support for:
+    - slider: type `0x01`, primary record length `0x58`, user slots `40`.
+    - gauge: type `z`, primary record length `0x54`, user slots `40`.
+    - progress bar: type `j`, primary record length `0x44`, user slots `33`.
+    - QR code: type `:`, primary record length `0x4C`, user slots `33`, text pointer at primary record offset `0x44`.
+  - Added a dynamic object-hash block scanner because slider adds a `slide` event block, so fixed hash-block offsets are no longer safe.
+  - Added optional local template loading from `C:\Users\SinYu\Desktop\case_for_codex\case_17_slider`, `case_18_gauge`, `case_20_progress`, and `case_21_qrcode`.
+- Generated artifacts:
+  - `reverse_usarthmi\extra_controls_demo\target_0.pa`
+  - `reverse_usarthmi\extra_controls_demo\output.tft`
+  - `reverse_usarthmi\extra_controls_demo\preview.png`
+  - `reverse_usarthmi\extra_controls_demo\after_upload.jpg`
+  - `reverse_usarthmi\extra_controls_demo\after_runtime_set.jpg`
+- Flash result:
+  - Uploaded `reverse_usarthmi\extra_controls_demo\output.tft` to `COM36`.
+  - File size: `11,415,284` bytes.
+  - Upload chunks: `2787`.
+  - Elapsed upload time: `209.469s`.
+- Live-screen visual result:
+  - The panel visibly rendered:
+    - title text `EXTRA CONTROLS`
+    - slider
+    - progress bar
+    - gauge needle
+    - QR code
+    - status text `slider / progress / gauge / qrcode`
+- Live runtime query result:
+  - `connect` returned `TJC8048X543_011C`.
+  - `sendme` returned page `0`.
+  - `get title.txt` returned `EXTRA CONTROLS`.
+  - `sld1.val=80` succeeded and `get sld1.val` returned `80`.
+  - `bar1.val=85` returned code `0x1C`; `get bar1.val` still returned `0`.
+  - `get gauge1.val` returned invalid reference `0x1A`.
+  - `get qr1.txt` returned invalid reference `0x1A`.
+- Current interpretation:
+  - Slider is now promoted to "display + runtime value works" for this seed path.
+  - Progress/gauge/QR are "display works, runtime property table/user-record mapping still incomplete".
+  - Timer remains excluded from the combined TFT because it is non-visual and does not follow the normal coordinate object body.

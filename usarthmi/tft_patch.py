@@ -5,15 +5,42 @@ from pathlib import Path
 from typing import Any
 
 from .object_hash import object_name_hash
-from .page_format import PageBlock, load_page_file
+from .hmi_inspect import inspect_hmi
+from .page_format import PageBlock, load_page_file, parse_page_data
 from .tft_checksum import _crc32_like, update_tft_checksum
 from .tft_reverse import reverse_tft_tail
 from .tft_toolchain import TftToolchainError, _load_tfttool_module, inspect_tft
 
 
 COORD_FIELDS = ("x", "y", "w", "h", "endx", "endy")
-TYPE_RECORD_LENGTHS = {"y": 0x40, "t": 0x54, "b": 0x54, "p": 0x3C}
-TYPE_USER_SLOT_COUNTS = {"y": 33, "t": 41, "b": 42, "p": 28}
+TYPE_RECORD_LENGTHS = {
+    "y": 0x40,
+    "t": 0x54,
+    "b": 0x54,
+    "p": 0x3C,
+    "\x01": 0x58,  # slider
+    "z": 0x54,  # gauge
+    "j": 0x44,  # progress bar
+    ":": 0x4C,  # QR code
+}
+TYPE_USER_SLOT_COUNTS = {
+    "y": 33,
+    "t": 41,
+    "b": 42,
+    "p": 28,
+    "\x01": 40,
+    "z": 40,
+    "j": 33,
+    ":": 33,
+}
+TEXT_POINTER_RECORD_OFFSETS = {"t": 0x48, "b": 0x4C, ":": 0x44}
+KNOWN_EXTRA_TYPE_CASES = {
+    "\x01": "case_17_slider",
+    "z": "case_18_gauge",
+    "j": "case_20_progress",
+    ":": "case_21_qrcode",
+}
+DEFAULT_CASE_ROOT = Path(r"C:\Users\SinYu\Desktop\case_for_codex")
 IMAGE_BUTTON_USER_SLOT_COUNT = 41
 MIRROR_VALUE_COUNT = 41
 IMAGE_BUTTON_MIRROR_VALUE_COUNT = 42
@@ -143,7 +170,7 @@ class AddedObjectPatchResult:
                 for key, value in self.section_offsets.items()
             },
             "warnings": [
-                "Experimental V1 supports appending one or more t/b/p objects to the current seed layout.",
+                "Experimental V1 supports appending one or more known object records to the current seed layout.",
                 "Object-name hashes are generated with the recovered 14-byte padded Nextion/TJC CRC32 algorithm.",
                 "Header CRCs, encrypted Header2 fields, and the final TFT checksum are recomputed.",
             ],
@@ -306,6 +333,7 @@ def patch_added_object_tft(
     added_blocks = _validate_added_objects(baseline_page.blocks, target_page.blocks)
 
     seed = _load_tail_seed(baseline_tft_path, baseline_pa_path, baseline_page)
+    _augment_seed_templates(seed, {block.type_code for block in target_page.blocks})
     tail, sections = _build_added_object_tail(seed, target_page.blocks)
     payload = bytearray(seed.raw[: seed.object_start] + tail)
     image_button_layout = _uses_full_image_button_layout(target_page.blocks)
@@ -364,8 +392,8 @@ def _validate_added_objects(base_blocks: list[PageBlock], target_blocks: list[Pa
             )
     added_blocks = target_blocks[len(base_blocks) :]
     for block in added_blocks:
-        if block.type_code not in {"t", "b", "p"}:
-            raise TftToolchainError(f"Added-object patch currently supports only t/b/p, got {block.type_code!r}")
+        if block.type_code not in TYPE_RECORD_LENGTHS:
+            raise TftToolchainError(f"Added-object patch currently does not support {block.type_code!r}")
     for block in target_blocks:
         if block.type_code not in TYPE_RECORD_LENGTHS:
             raise TftToolchainError(f"Unsupported object type in TFT tail generator: {block.type_code!r}")
@@ -396,11 +424,60 @@ def _added_block_summary(block: PageBlock) -> dict[str, Any]:
         "name": block.objname or "",
         "type": block.type_code or "",
         "id": _required_field_int(block, "id"),
-        "x": _required_field_int(block, "x"),
-        "y": _required_field_int(block, "y"),
-        "w": _required_field_int(block, "w"),
-        "h": _required_field_int(block, "h"),
+        "x": _field_int(block, "x"),
+        "y": _field_int(block, "y"),
+        "w": _field_int(block, "w"),
+        "h": _field_int(block, "h"),
     }
+
+
+def _augment_seed_templates(seed: _TailSeed, needed_types: set[str]) -> None:
+    missing = sorted(type_code for type_code in needed_types if type_code not in seed.primary_templates)
+    if not missing:
+        return
+
+    case_root = Path(DEFAULT_CASE_ROOT)
+    loaded_roots: dict[str, _TailSeed] = {}
+    unresolved: list[str] = []
+    for type_code in missing:
+        case_name = KNOWN_EXTRA_TYPE_CASES.get(type_code)
+        if not case_name:
+            unresolved.append(type_code)
+            continue
+        case_seed = loaded_roots.get(case_name)
+        if case_seed is None:
+            case_dir = case_root / case_name
+            case_tft = case_dir / "lcd_test.tft"
+            case_hmi = case_dir / "lcd_test.HMI"
+            if not case_tft.exists() or not case_hmi.exists():
+                unresolved.append(type_code)
+                continue
+            case_page = _load_hmi_page0(case_hmi)
+            case_seed = _load_tail_seed(case_tft, case_hmi, case_page)
+            loaded_roots[case_name] = case_seed
+
+        if type_code in case_seed.primary_templates:
+            seed.primary_templates[type_code] = case_seed.primary_templates[type_code]
+            seed.user_templates[type_code] = case_seed.user_templates[type_code]
+            seed.mirror_templates[type_code] = case_seed.mirror_templates[type_code]
+        else:
+            unresolved.append(type_code)
+
+    if unresolved:
+        readable = ", ".join(repr(item) for item in unresolved)
+        raise TftToolchainError(
+            "Missing compiled TFT templates for object type(s): "
+            f"{readable}. Provide official case fixtures under {case_root} or avoid these controls."
+        )
+
+
+def _load_hmi_page0(hmi_path: Path):
+    inspection = inspect_hmi(hmi_path)
+    raw = hmi_path.read_bytes()
+    entry = next((item for item in inspection.entries if item.name == "0.pa"), None)
+    if entry is None or not entry.in_file:
+        raise TftToolchainError(f"0.pa not found in {hmi_path}")
+    return parse_page_data(raw[entry.data_offset : entry.data_offset + entry.length])
 
 
 def _load_tail_seed(
@@ -433,13 +510,13 @@ def _load_tail_seed(
     prefix_head = tail[:0x145]
     page_event = tail[0x145:0x16D]
     object_event = tail[0x16D:0x187]
-    baseline_hash_offset = 0x145 + len(page_event) + len(object_event) * (len(baseline_page.blocks) - 1)
-    hash_size = int.from_bytes(tail[baseline_hash_offset : baseline_hash_offset + 4], "little")
-    hash_data = tail[baseline_hash_offset + 4 : baseline_hash_offset + 4 + hash_size]
-    if hash_size != len(baseline_page.blocks) * 6 or len(hash_data) != hash_size:
-        raise TftToolchainError("Baseline TFT hash/index block does not match baseline .pa object count")
-
     by_id = {_field_int(block, "id"): block.objname for block in baseline_page.blocks}
+    expected_hash_by_id = {
+        object_id: _object_name_hash_or_error(name)
+        for object_id, name in by_id.items()
+        if object_id is not None and name
+    }
+    baseline_hash_offset, hash_data = _find_hash_block(tail, expected_hash_by_id)
     hash_by_name: dict[str, int] = {}
     for offset in range(0, len(hash_data), 6):
         object_hash = int.from_bytes(hash_data[offset : offset + 4], "little")
@@ -454,7 +531,7 @@ def _load_tail_seed(
                 )
             hash_by_name[name] = object_hash
 
-    primary_block_offset = baseline_hash_offset + 4 + hash_size
+    primary_block_offset = baseline_hash_offset + 4 + len(hash_data)
     primary_size = int.from_bytes(tail[primary_block_offset : primary_block_offset + 4], "little")
     primary_data_start = primary_block_offset + 4
     if primary_data_start + primary_size > len(tail):
@@ -535,6 +612,27 @@ def _load_tail_seed(
         mirror_templates=mirror_templates,
         hash_by_name=hash_by_name,
     )
+
+
+def _find_hash_block(tail: bytes, expected_hash_by_id: dict[int, int]) -> tuple[int, bytes]:
+    hash_size = len(expected_hash_by_id) * 6
+    search_end = min(len(tail) - 4 - hash_size, 0x2000)
+    for offset in range(0x100, max(search_end, 0x100)):
+        if int.from_bytes(tail[offset : offset + 4], "little") != hash_size:
+            continue
+        data = tail[offset + 4 : offset + 4 + hash_size]
+        seen: dict[int, int] = {}
+        valid = True
+        for cursor in range(0, len(data), 6):
+            object_hash = int.from_bytes(data[cursor : cursor + 4], "little")
+            object_id = int.from_bytes(data[cursor + 4 : cursor + 6], "little")
+            if expected_hash_by_id.get(object_id) != object_hash:
+                valid = False
+                break
+            seen[object_id] = object_hash
+        if valid and set(seen) == set(expected_hash_by_id):
+            return offset, data
+    raise TftToolchainError("Unable to locate compiled TFT object hash/index block")
 
 
 def _build_added_object_tail(
@@ -658,15 +756,21 @@ def _build_page_event_table(block: PageBlock) -> bytes:
 
 def _build_object_event_table(block: PageBlock) -> bytes:
     events = _events_by_prefix(block)
-    return b"".join(
-        [
-            _compile_event_script([]),
-            _event_item(b"down"),
-            _compile_event_script(events.get("codesdown-", [])),
-            _event_item(b"up"),
-            _compile_event_script(events.get("codesup-", [])),
-        ]
-    )
+    parts = [
+        _compile_event_script([]),
+        _event_item(b"down"),
+        _compile_event_script(events.get("codesdown-", [])),
+        _event_item(b"up"),
+        _compile_event_script(events.get("codesup-", [])),
+    ]
+    if block.type_code == "\x01":
+        parts.extend(
+            [
+                _event_item(b"slide"),
+                _compile_event_script(events.get("codesslide-", [])),
+            ]
+        )
+    return b"".join(parts)
 
 
 def _events_by_prefix(block: PageBlock) -> dict[str, list[str]]:
@@ -780,12 +884,12 @@ def _build_primary_block(
             _patch_text_record(record, block)
         elif type_code == "b":
             _patch_button_record(record, block)
-        if type_code in {"t", "b"}:
+        if type_code in TEXT_POINTER_RECORD_OFFSETS:
             text = _field_text(block, "txt") or ""
             slot_len = _text_slot_len(block)
             pointer = primary_pre_string_len + 0x14 + string_cursor
             text_pointer_by_id[object_id] = pointer
-            pointer_offset = 0x1C + (0x2C if type_code == "t" else 0x30)
+            pointer_offset = TEXT_POINTER_RECORD_OFFSETS[type_code]
             record[pointer_offset : pointer_offset + 4] = pointer.to_bytes(4, "little")
             text_slots.append((text, slot_len))
             string_cursor += slot_len
